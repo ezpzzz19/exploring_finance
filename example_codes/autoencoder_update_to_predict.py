@@ -236,7 +236,7 @@ if __name__ == "__main__":
     pd.set_option("mode.chained_assignment", None)
 
     # read sample data
-    file_path = "./homework_sample_big.csv"
+    file_path = "data/homework_sample_big.csv"
     raw = pd.read_csv(file_path, parse_dates=["date"], low_memory=False)
     raw = raw.drop(columns=["date"])
     raw["day"] = 1
