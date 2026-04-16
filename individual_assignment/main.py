@@ -1,10 +1,9 @@
 """
 Individual Assignment - Ensemble Alpha Strategy
 ================================================
-Three-model ensemble for stock return prediction:
-  1. IPCA         - conditional factor model, OOS predicted returns
+Two-model ensemble for stock return prediction:
+  1. XGBoost      - gradient boosted trees for direct return prediction
   2. Autoencoder  - conditional factor model via managed portfolios
-  3. NN3          - direct characteristics to return feedforward network
 
 Each model produces its own OOS return predictions independently.
 Final signal = equal-weight average of available model predictions.
@@ -19,21 +18,18 @@ import os
 import sys
 import warnings
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import statsmodels.formula.api as smf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from pandas.tseries.offsets import MonthBegin
+import xgboost as xgb
+from xgboost import XGBRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import TensorDataset
-
-from ipca_torch import IPCA
 
 warnings.filterwarnings("ignore")
 pd.set_option("mode.chained_assignment", None)
@@ -42,97 +38,74 @@ SEED = 42
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-else:
-    DEVICE = torch.device("cpu")
-USE_GPU = DEVICE.type == "cuda"
+def _get_device():
+    """
+    Pick the best available device in priority order:
+      1. CUDA  (NVIDIA GPU)
+      2. MPS   (Apple Silicon)
+      3. CPU   (fallback)
+    Works on Lightning AI, local Mac, or any cloud GPU provider.
+    """
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
+
+DEVICE = _get_device()
 print(f"Device: {DEVICE}", flush=True)
 
 
 # ===========================================================================
-#  MODEL 1: NN3
+#  MODEL 1: XGBoost (Gradient Boosted Trees)
 # ===========================================================================
 
-class NN3(nn.Module):
-    def __init__(self, input_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.fc3 = nn.Linear(32, 16)
-        self.bn3 = nn.BatchNorm1d(16)
-        self.fc4 = nn.Linear(16, 1)
+def xgb_predict(X_train, Y_train_dm, X_val, Y_val_dm, X_test):
+    """
+    XGBoost with hyperparameter grid search over learning rate and max_depth,
+    following the tree.py pattern from the labs.
+    """
+    # Grid search over learning rate (10^lambda) and tree depth
+    lambdas = np.arange(-2, -0.9, 1)          # 0.01, 0.1
+    nl = list(range(1, 3))                      # depth 1, 2
+    n_trees = 1000
+    val_mse = np.zeros((len(lambdas), len(nl)))
 
-    def forward(self, x):
-        x = F.relu(self.bn1(self.fc1(x)))
-        x = F.relu(self.bn2(self.fc2(x)))
-        x = F.relu(self.bn3(self.fc3(x)))
-        return self.fc4(x).squeeze(-1)
+    for ind, i in enumerate(lambdas):
+        for jnd, j in enumerate(nl):
+            model = XGBRegressor(
+                n_estimators=n_trees, max_depth=j,
+                learning_rate=(10 ** i), tree_method='hist',
+                reg_alpha=0, reg_lambda=0, random_state=SEED,
+            )
+            callbacks = [xgb.callback.EarlyStopping(rounds=15, save_best=True)]
+            model.fit(
+                X_train, Y_train_dm,
+                eval_set=[(X_val, Y_val_dm)],
+                callbacks=callbacks, verbose=False,
+            )
+            val_mse[ind, jnd] = mean_squared_error(
+                Y_val_dm, model.predict(X_val)
+            )
 
+    # Refit best model
+    best_i, best_j = divmod(val_mse.argmin(), val_mse.shape[1])
+    best_lr = 10 ** lambdas[best_i]
+    best_depth = nl[best_j]
+    print(f"      XGB best: lr={best_lr:.4f}, depth={best_depth}", flush=True)
 
-def _train_nn(model, criterion, loader, optimizer, device, l1_lambda=1e-4):
-    model.train()
-    total_loss = 0
-    for X_b, Y_b in loader:
-        X_b, Y_b = X_b.to(device), Y_b.to(device)
-        optimizer.zero_grad()
-        pred = model(X_b)
-        loss = criterion(pred, Y_b)
-        loss += l1_lambda * torch.norm(model.fc1.weight, p=1)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * len(X_b)
-    return total_loss / len(loader.dataset)
-
-
-def _eval_nn(model, criterion, loader, device):
-    model.eval()
-    total_loss = 0
-    with torch.no_grad():
-        for X_b, Y_b in loader:
-            X_b, Y_b = X_b.to(device), Y_b.to(device)
-            loss = criterion(model(X_b), Y_b)
-            total_loss += loss.item() * len(X_b)
-    return total_loss / len(loader.dataset)
-
-
-def nn_predict(input_size, X_train, Y_train_dm, X_val, Y_val_dm, X_test,
-               device, ensemble=3, epochs=100, patience=5, batch_size=2048):
-    train_ds = TensorDataset(torch.from_numpy(X_train).float(),
-                             torch.from_numpy(Y_train_dm).float())
-    val_ds = TensorDataset(torch.from_numpy(X_val).float(),
-                           torch.from_numpy(Y_val_dm).float())
-    X_test_t = torch.from_numpy(X_test).float().to(device)
-    all_preds = np.zeros((X_test.shape[0], ensemble))
-
-    for i in range(ensemble):
-        model = NN3(input_size).to(device)
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=0.01)
-        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.955)
-        tr_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
-        va_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False)
-
-        best_val, no_improve, best_state = 1e9, 0, None
-        for epoch in range(epochs):
-            _train_nn(model, criterion, tr_loader, optimizer, device)
-            vl = _eval_nn(model, criterion, va_loader, device)
-            if vl < best_val:
-                best_val, no_improve = vl, 0
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            else:
-                no_improve += 1
-            if no_improve >= patience:
-                break
-            scheduler.step()
-
-        model.load_state_dict(best_state)
-        model.eval()
-        with torch.no_grad():
-            all_preds[:, i] = model(X_test_t).cpu().numpy()
-    return all_preds.mean(axis=1)
+    model = XGBRegressor(
+        n_estimators=n_trees, max_depth=best_depth,
+        learning_rate=best_lr, tree_method='hist',
+        reg_alpha=0, reg_lambda=0, random_state=SEED,
+    )
+    callbacks = [xgb.callback.EarlyStopping(rounds=15, save_best=True)]
+    model.fit(
+        X_train, Y_train_dm,
+        eval_set=[(X_val, Y_val_dm)],
+        callbacks=callbacks, verbose=False,
+    )
+    return model.predict(X_test)
 
 
 # ===========================================================================
@@ -264,15 +237,52 @@ def ae_predict(Z_train, X_train, Y_train,
 
 def load_and_preprocess(data_dir):
     print("Loading data...", flush=True)
-    raw = pd.read_csv(os.path.join(data_dir, "mma_sample_v2.csv"), low_memory=False)
-    stock_vars = list(
+    # Use enhanced dataset (with WRDS ratios) if available, else fallback
+    enhanced_path = os.path.join(data_dir, "mma_sample_enhanced.csv")
+    base_path = os.path.join(data_dir, "mma_sample_v2.csv")
+    if os.path.exists(enhanced_path):
+        print("  Using ENHANCED dataset (with WRDS financial ratios)", flush=True)
+        raw = pd.read_csv(enhanced_path, parse_dates=["date"], low_memory=False)
+    else:
+        print("  Using base dataset (run download_wrds_ratios.py to enhance)", flush=True)
+        raw = pd.read_csv(base_path, parse_dates=["date"], low_memory=False)
+
+    all_vars = list(
         pd.read_csv(os.path.join(data_dir, "factor_char_list.csv"))["variable"].values
     )
+    # Also include any WRDS columns that were merged in
+    wrds_extra_cols = [
+        # Financial Ratios Suite
+        "capei", "evm", "pe_op_dil", "pe_exi", "ps", "pcf", "ptb",
+        "peg_trailing", "divyield", "npm", "opmbd", "opmad", "gpm", "cfm",
+        "roa", "roe", "roce", "efftax", "aftret_eq", "aftret_invcapx",
+        "pretret_noa", "de_ratio", "debt_ebitda", "debt_capital", "debt_at",
+        "intcov_ratio", "curr_ratio", "quick_ratio", "cash_ratio",
+        "cash_conversion", "inv_turn", "rect_turn", "pay_turn", "sale_invcap",
+        "accrual", "fcf_ocf", "cash_debt", "short_debt",
+        # IBES Analyst Consensus
+        "ibes_numest", "ibes_meanest", "ibes_medest", "ibes_stdev",
+        "ibes_disp", "ibes_range", "ibes_revision",
+        "ibes_numup", "ibes_numdown",
+        # Institutional Ownership
+        "io_num_holders", "io_new_holders", "io_share_change_pct",
+        "io_buy_sell_ratio",
+        # Short Interest
+        "si_shares_short", "si_shares_short_chg",
+    ]
+    extra_vars = [c for c in wrds_extra_cols if c in raw.columns and c not in all_vars]
+    all_vars = all_vars + extra_vars
+    # Keep only predictors that actually exist in the data
+    stock_vars = [v for v in all_vars if v in raw.columns]
+    print(f"  Using {len(stock_vars)} characteristics ({len(extra_vars)} from WRDS)", flush=True)
+
     mkt = pd.read_csv(os.path.join(data_dir, "mkt_ind.csv"))
 
-    raw["date"] = pd.to_datetime(
-        raw["year"].astype(str) + "-" + raw["month"].astype(str) + "-01"
-    )
+    # Ensure date column exists (use existing or construct from year/month)
+    if "date" not in raw.columns or raw["date"].isna().all():
+        raw["date"] = pd.to_datetime(
+            raw["year"].astype(str) + "-" + raw["month"].astype(str) + "-01"
+        )
     raw = raw[raw["stock_exret"].notna()].copy()
     for var in stock_vars:
         raw[var] = raw[var].astype(float)
@@ -302,51 +312,11 @@ def load_and_preprocess(data_dir):
 
 
 # ===========================================================================
-#  IPCA - OOS PREDICTED RETURNS
+#  EXPANDING-WINDOW ENSEMBLE  (XGBoost + Autoencoder)
 # ===========================================================================
 
-def run_ipca_stage(data, stock_vars, K=6, oos_min_periods=96):
-    print(f"\n{'='*60}", flush=True)
-    print(f"IPCA  (K={K}, OOS min periods={oos_min_periods})", flush=True)
-    print(f"{'='*60}", flush=True)
-
-    ipca_data = data.set_index(["date", "permno"])[["stock_exret"] + stock_vars].copy()
-    dates = ipca_data.index.get_level_values(0).unique().sort_values()
-    gFac = pd.DataFrame(1.0, index=["anomaly"], columns=dates)
-
-    model = IPCA(K=K, add_constant=True, device=str(DEVICE), max_iter=500, min_tol=1e-4)
-    results = model.fit(
-        ipca_data, return_col="stock_exret",
-        OOS=True, OOS_min_periods=oos_min_periods,
-        gFac=gFac, Beta_fit=True, R_fit=True,
-        disp=True, disp_every=24,
-    )
-
-    beta_df = results["fittedBeta"]
-    if results["rfits"]:
-        print(f"  IPCA R2_Total: {results['rfits']['R2_Total']:.6f}", flush=True)
-        print(f"  IPCA R2_Pred:  {results['rfits']['R2_Pred']:.6f}", flush=True)
-
-    lambda_df = results["Lambda"]
-    oos_dates = beta_df.index.get_level_values(0).unique().sort_values()
-    parts = []
-    for t in oos_dates:
-        bt = beta_df.loc[t]
-        lt = lambda_df[t].values
-        parts.append(pd.DataFrame({"ipca_pred": bt.values @ lt}, index=bt.index))
-    ipca_pred = pd.concat(parts, keys=oos_dates, names=["date", "permno"])
-
-    print(f"  IPCA predictions: {len(ipca_pred):,} rows, "
-          f"{ipca_pred.index.get_level_values(0).nunique()} months", flush=True)
-    return ipca_pred
-
-
-# ===========================================================================
-#  EXPANDING-WINDOW ENSEMBLE  (NN3 + Autoencoder + IPCA)
-# ===========================================================================
-
-def run_ensemble_stage(data, stock_vars, ipca_pred):
-    print("ENSEMBLE  (NN3 + Autoencoder + IPCA)", flush=True)
+def run_ensemble_stage(data, stock_vars):
+    print("ENSEMBLE  (XGBoost + Autoencoder)", flush=True)
 
     ret_var = "stock_exret"
 
@@ -411,17 +381,15 @@ def run_ensemble_stage(data, stock_vars, ipca_pred):
 
         reg_pred = test[["year", "month", "date", "permno", ret_var]].copy()
 
-        # (A) NN3
-        print("    NN3...", flush=True)
-        nn_p = nn_predict(
-            input_size=X_train_sc.shape[1],
+        # (A) XGBoost
+        print("    XGBoost...", flush=True)
+        xgb_p = xgb_predict(
             X_train=X_train_sc, Y_train_dm=Y_train_dm,
             X_val=X_val_sc, Y_val_dm=Y_val_dm,
-            X_test=X_test_sc, device=DEVICE,
-            ensemble=3, epochs=100, patience=5, batch_size=2048,
+            X_test=X_test_sc,
         ) + Y_mean
-        reg_pred["nn3"] = nn_p
-        print("    NN3 done", flush=True)
+        reg_pred["xgb"] = xgb_p
+        print("    XGBoost done", flush=True)
 
         # (B) Autoencoder
         print("    Autoencoder...", flush=True)
@@ -445,15 +413,8 @@ def run_ensemble_stage(data, stock_vars, ipca_pred):
         reg_pred["ae"] = ae_p
         print("    AE done", flush=True)
 
-        # (C) IPCA (pre-computed, just merge)
-        test_idx = test.set_index(["date", "permno"]).index
-        ipca_matched = ipca_pred.reindex(test_idx)
-        reg_pred["ipca"] = ipca_matched["ipca_pred"].values
-        n_ipca = reg_pred["ipca"].notna().sum()
-        print(f"    IPCA: {n_ipca}/{len(reg_pred)} matched", flush=True)
-
         # Ensemble average
-        model_cols = ["nn3", "ae", "ipca"]
+        model_cols = ["xgb", "ae"]
         reg_pred["ensemble"] = reg_pred[model_cols].mean(axis=1, skipna=True)
 
         pred_out = pd.concat([pred_out, reg_pred], ignore_index=True)
@@ -464,7 +425,7 @@ def run_ensemble_stage(data, stock_vars, ipca_pred):
     print(f"\n{'-'*60}", flush=True)
     print("OOS R-squared (benchmark = 0):", flush=True)
     yreal = pred_out[ret_var].values
-    for mn in ["nn3", "ae", "ipca", "ensemble"]:
+    for mn in ["xgb", "ae", "ensemble"]:
         yp = pred_out[mn].values
         mask = ~np.isnan(yp)
         if mask.sum() == 0:
@@ -477,150 +438,6 @@ def run_ensemble_stage(data, stock_vars, ipca_pred):
 
 
 # ===========================================================================
-#  PORTFOLIO CONSTRUCTION & EVALUATION
-# ===========================================================================
-
-def evaluate_portfolio(pred_out, mkt, model="ensemble", n_long=60, n_short=40):
-    print(f"\n{'='*60}", flush=True)
-    print(f"PORTFOLIO EVALUATION  (model={model}, long={n_long}, short={n_short})", flush=True)
-    print(f"{'='*60}", flush=True)
-
-    ret_var = "stock_exret"
-    pred = pred_out[pred_out[model].notna()].copy()
-
-    predicted = pred.groupby(["year", "month"])[model]
-    pred["rank"] = np.floor(
-        predicted.transform(lambda s: s.rank()) * 10
-        / predicted.transform(lambda s: len(s) + 1)
-    )
-    pred = pred.sort_values(["year", "month", "rank", "permno"])
-
-    monthly_port = (
-        pred.groupby(["year", "month", "rank"])
-        .apply(lambda df: np.mean(df[ret_var]))
-        .unstack().dropna().reset_index()
-    )
-    monthly_port.columns = ["year", "month"] + [f"port_{x}" for x in range(1, 11)]
-    monthly_port["port_LS"] = monthly_port["port_10"] - monthly_port["port_1"]
-
-    ls_returns, long_holdings, short_holdings = [], [], []
-    for (yr, mo), group in pred.groupby(["year", "month"]):
-        sg = group.sort_values(model, ascending=False)
-        top = sg.head(n_long)
-        bottom = sg.tail(n_short)
-        lr = top[ret_var].mean()
-        sr_val = bottom[ret_var].mean()
-        ls_returns.append({"year": yr, "month": mo,
-                           "long_ret": lr, "short_ret": sr_val,
-                           "ls_ret": lr - sr_val})
-        long_holdings.append(top[["year", "month", "date", "permno"]])
-        short_holdings.append(bottom[["year", "month", "date", "permno"]])
-
-    strat = pd.DataFrame(ls_returns)
-    strat = strat.merge(mkt, on=["year", "month"], how="inner")
-    strat["mkt_rf"] = strat["sp_ret"] - strat["rf"]
-
-    T = len(strat)
-    mr = strat["ls_ret"].mean()
-    sd = strat["ls_ret"].std()
-    sharpe = mr / sd * np.sqrt(12)
-    print(f"\n  Months: {T}", flush=True)
-    print(f"  Mean monthly return:  {mr*100:.3f}%", flush=True)
-    print(f"  Std monthly return:   {sd*100:.3f}%", flush=True)
-    print(f"  Annualized Sharpe:    {sharpe:.3f}", flush=True)
-
-    nw = smf.ols(formula="ls_ret ~ mkt_rf", data=strat).fit(
-        cov_type="HAC", cov_kwds={"maxlags": 6}, use_t=True)
-    alpha = nw.params["Intercept"]
-    beta = nw.params["mkt_rf"]
-    alpha_t = nw.tvalues["Intercept"]
-    ir = alpha / np.sqrt(nw.mse_resid) * np.sqrt(12)
-    print(f"\n  CAPM Alpha (monthly): {alpha*100:.3f}%  (t={alpha_t:.2f})", flush=True)
-    print(f"  CAPM Alpha (annual):  {alpha*12*100:.3f}%", flush=True)
-    print(f"  CAPM Beta:            {beta:.3f}", flush=True)
-    print(f"  Information Ratio:    {ir:.3f}", flush=True)
-
-    max_loss = strat["ls_ret"].min()
-    print(f"\n  Max 1-month loss:     {max_loss*100:.3f}%", flush=True)
-
-    strat["log_ret"] = np.log(strat["ls_ret"] + 1)
-    strat["cum_log"] = strat["log_ret"].cumsum()
-    peak = strat["cum_log"].cummax()
-    max_dd = (peak - strat["cum_log"]).max()
-    print(f"  Maximum Drawdown:     {max_dd*100:.3f}%", flush=True)
-
-    long_df = pd.concat(long_holdings, ignore_index=True)
-    short_df = pd.concat(short_holdings, ignore_index=True)
-
-    def calc_turnover(df):
-        start = df[["permno", "date"]].sort_values(["date", "permno"])
-        sc = start.groupby("date")["permno"].count().reset_index()
-        end = df[["permno", "date"]].copy()
-        end["date"] = end["date"] - MonthBegin(1)
-        end = end.sort_values(["date", "permno"])
-        remain = start.merge(end, on=["date", "permno"], how="inner")
-        rc = remain.groupby("date")["permno"].count().reset_index()
-        rc = rc.rename(columns={"permno": "remain"})
-        m = sc.merge(rc, on="date", how="inner")
-        m["turnover"] = (m["permno"] - m["remain"]) / m["permno"]
-        return m["turnover"].mean()
-
-    l_to = calc_turnover(long_df)
-    s_to = calc_turnover(short_df)
-    print(f"\n  Long turnover:        {l_to*100:.1f}%", flush=True)
-    print(f"  Short turnover:       {s_to*100:.1f}%", flush=True)
-
-    print(f"\n  --- Long-only portfolio (top {n_long}) ---", flush=True)
-    lm = strat["long_ret"].mean()
-    ls_std = strat["long_ret"].std()
-    print(f"  Mean monthly return:  {lm*100:.3f}%", flush=True)
-    print(f"  Annualized Sharpe:    {lm/ls_std*np.sqrt(12):.3f}", flush=True)
-
-    strat["date_plot"] = pd.to_datetime(
-        strat["year"].astype(str) + "-" + strat["month"].astype(str) + "-01")
-
-    # Rolling annualized Sharpe ratio (expanding window from start)
-    def expanding_sharpe(series):
-        """Compute expanding annualized Sharpe ratio at each point."""
-        sharpes = []
-        for i in range(1, len(series) + 1):
-            s = series.iloc[:i]
-            if i < 2:
-                sharpes.append(0.0)
-            else:
-                sharpes.append(s.mean() / s.std() * np.sqrt(12))
-        return pd.Series(sharpes, index=series.index)
-
-    strat["sharpe_ls"] = expanding_sharpe(strat["ls_ret"]).values
-    strat["sharpe_long"] = expanding_sharpe(strat["long_ret"]).values
-    strat["sharpe_mkt"] = expanding_sharpe(strat["sp_ret"]).values
-
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(strat["date_plot"], strat["sharpe_ls"], label="Long-Short", linewidth=2)
-    ax.plot(strat["date_plot"], strat["sharpe_long"], label=f"Long Top {n_long}", linewidth=1.5)
-    ax.plot(strat["date_plot"], strat["sharpe_mkt"], label="S&P 500", linewidth=1.5, alpha=0.7)
-    ax.axhline(y=0, color="black", linestyle="--", linewidth=0.5)
-    ax.set_title("Expanding Annualized Sharpe Ratio - Ensemble Alpha (NN3 + Autoencoder + IPCA)")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Annualized Sharpe Ratio")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
-    plt.tight_layout()
-
-    os.makedirs("output", exist_ok=True)
-    plt.savefig("output/cumulative_returns.png", dpi=150)
-    print(f"\n  Plot saved to output/cumulative_returns.png", flush=True)
-
-    strat.to_csv("output/strategy_returns.csv", index=False)
-    monthly_port.to_csv("output/decile_returns.csv", index=False)
-    print("  Strategy returns saved to output/strategy_returns.csv", flush=True)
-
-    print(f"\n{nw.summary()}", flush=True)
-
-    return strat, monthly_port
-
-
-# ===========================================================================
 #  MAIN
 # ===========================================================================
 
@@ -629,21 +446,17 @@ if __name__ == "__main__":
     print(f"Start: {t_start}")
     print(f"{'='*60}\n")
 
-    DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+    DATA_DIR = os.path.join(os.path.dirname(__file__), "data_we")
 
     data, stock_vars, mkt = load_and_preprocess(DATA_DIR)
 
-    # IPCA: OOS predicted returns (first 96 months train, OOS from Jan 2008)
-    ipca_pred = run_ipca_stage(data, stock_vars, K=6, oos_min_periods=96)
-
-    # Ensemble: NN3 + Autoencoder + IPCA
-    pred_out = run_ensemble_stage(data, stock_vars, ipca_pred)
+    # Ensemble: XGBoost + Autoencoder
+    pred_out = run_ensemble_stage(data, stock_vars)
 
     os.makedirs("output", exist_ok=True)
     pred_out.to_csv("output/predictions.csv", index=False)
     print("\nPredictions saved to output/predictions.csv", flush=True)
-
-    strat, deciles = evaluate_portfolio(pred_out, mkt, model="ensemble", n_long=60, n_short=40)
+    print("Now run build_portfolio.py to construct the trading strategy.", flush=True)
 
     t_end = datetime.datetime.now()
     print(f"\nTotal runtime: {t_end - t_start}")
