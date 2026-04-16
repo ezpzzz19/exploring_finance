@@ -63,6 +63,11 @@ ratios["month"] = ratios["public_date"].dt.month
 ratios["permno"] = ratios["permno"].astype(int)
 ratios.drop(columns=["public_date"], inplace=True)
 
+# Deduplicate: keep last row per (permno, year, month)
+before_dedup = len(ratios)
+ratios = ratios.groupby(["permno", "year", "month"]).last().reset_index()
+print(f"  Deduped ratios: {before_dedup} → {len(ratios)} rows")
+
 # Drop overlapping columns
 ratio_feat = [c for c in ratios.columns if c not in ("permno", "year", "month")]
 drop_cols = [c for c in ratio_feat if c.lower() in existing_cols]
@@ -251,6 +256,19 @@ for name, data, cols in [
 all_new = new_ratio_cols + new_ibes_cols + list(new_io_cols) + new_si_cols
 print(f"\nTotal new features: {len(all_new)}")
 print(f"Final shape: {merged.shape}")
+
+# ── Duplicate check ──────────────────────────────────────────────────────────
+dup_count = merged.duplicated(subset=["permno", "year", "month"]).sum()
+print(f"\nDuplicate (permno, year, month) rows: {dup_count}")
+if dup_count > 0:
+    print("  ⚠ Dropping duplicates — keeping last occurrence ...")
+    merged = merged.drop_duplicates(subset=["permno", "year", "month"], keep="last")
+    print(f"  Shape after dedup: {merged.shape}")
+else:
+    print("  ✅ No duplicates found")
+
+assert merged.duplicated(subset=["permno", "year", "month"]).sum() == 0, \
+    "FATAL: duplicates remain after dedup!"
 
 # ── Save ─────────────────────────────────────────────────────────────────────
 merged.to_csv(OUTPUT_PATH, index=False)
