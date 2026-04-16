@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 import wrds
 import os
+import sqlalchemy
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data_we")
 OUTPUT_PATH = os.path.join(DATA_DIR, "mma_sample_enhanced.csv")
@@ -28,6 +29,13 @@ df["month"] = df["month"].astype(int)
 
 print("Connecting to WRDS ...")
 db = wrds.Connection(wrds_username='etremblay')
+
+# Workaround: pandas 3.x + SQLAlchemy 1.4 compatibility issue.
+# Use engine.raw_connection() to get a DBAPI2 connection that pandas accepts.
+_raw_conn = db.engine.raw_connection()
+def _patched_raw_sql(sql, **kwargs):
+    return pd.read_sql_query(sql, _raw_conn, **kwargs)
+db.raw_sql = _patched_raw_sql
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SOURCE 1: Financial Ratios Suite
@@ -236,10 +244,24 @@ print(f"  New SI features: {len(new_si_cols)} → {new_si_cols}")
 db.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  MERGE ALL
+#  MERGE ALL  (with 2-month lag to avoid look-ahead bias)
 # ══════════════════════════════════════════════════════════════════════════════
 print("\n" + "=" * 60)
-print("Merging all sources ...")
+print("Merging all sources (lagged 2 months to prevent look-ahead bias) ...")
+print("  JKP convention: row (year, month) has chars from end of month-1")
+print("  WRDS data from month t → matched to JKP row for month t+2")
+print("  This ensures all WRDS data is known before the portfolio formation date.")
+
+def lag_wrds(wrds_df, lag_months=2):
+    """Shift WRDS data forward by `lag_months` so it aligns with JKP timing.
+    E.g. WRDS data from Jan 2010 → assigned to Mar 2010 row."""
+    d = wrds_df.copy()
+    d["_dt"] = pd.to_datetime(d["year"].astype(str) + "-" + d["month"].astype(str) + "-01")
+    d["_dt"] = d["_dt"] + pd.DateOffset(months=lag_months)
+    d["year"] = d["_dt"].dt.year
+    d["month"] = d["_dt"].dt.month
+    d.drop(columns=["_dt"], inplace=True)
+    return d
 
 merged = df.copy()
 for name, data, cols in [
@@ -248,8 +270,9 @@ for name, data, cols in [
     ("Inst. Ownership",  io,     new_io_cols),
     ("Short Interest",   si,     new_si_cols),
 ]:
+    data_lagged = lag_wrds(data, lag_months=2)
     before = merged.shape[1]
-    merged = merged.merge(data, on=["permno", "year", "month"], how="left")
+    merged = merged.merge(data_lagged, on=["permno", "year", "month"], how="left")
     cov = merged[cols[0]].notna().mean() if cols else 0
     print(f"  + {name}: {len(cols)} cols, {cov:.1%} coverage → {merged.shape}")
 

@@ -14,4 +14,5 @@ dependencies = [
     "openpyxl>=3.1.0",
     "matplotlib>=3.10.8",
     "gdown>=5.0.0",
+    "wrds>=3.1.6",
 ]

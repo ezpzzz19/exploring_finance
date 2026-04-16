@@ -920,6 +920,175 @@ def generate_slide_deck_outputs(pred, holdings, strat_m, metrics, mkt,
 
 
 # ===========================================================================
+#  PPT-READY COMPARISON CHARTS
+# ===========================================================================
+
+def generate_ppt_charts(strat_m, metrics, mkt, model, n_long, n_short, scheme):
+    """Generate polished comparison charts suitable for PowerPoint slides."""
+    out_dir = os.path.join(os.path.dirname(__file__), "output", "slide_deck")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Ensure date column
+    if "date_plot" not in strat_m.columns:
+        strat_m = strat_m.copy()
+        strat_m["date_plot"] = pd.to_datetime(
+            strat_m["year"].astype(str) + "-" + strat_m["month"].astype(str) + "-01")
+
+    dates = strat_m["date_plot"]
+
+    # Cumulative returns
+    cum_ls = (1 + strat_m["ls_ret"]).cumprod()
+    cum_long = (1 + strat_m["long_ret"]).cumprod()
+    cum_sp = (1 + strat_m["sp_ret"]).cumprod()
+
+    # --- Chart 1: Cumulative Growth of $1 ---
+    fig, ax = plt.subplots(figsize=(14, 7))
+    ax.plot(dates, cum_ls, label=f"L/S Strategy (L{n_long}/S{n_short})",
+            linewidth=2.5, color="#1f77b4")
+    ax.plot(dates, cum_long, label=f"Long-Only (Top {n_long})",
+            linewidth=2, color="#2ca02c", linestyle="--")
+    ax.plot(dates, cum_sp, label="S&P 500",
+            linewidth=2, color="#ff7f0e", linestyle="-.")
+    ax.axhline(y=1, color="grey", linewidth=0.5, linestyle=":")
+    ax.fill_between(dates, cum_ls, 1, alpha=0.08, color="#1f77b4")
+    ax.set_title("Cumulative Growth of $1 Investment", fontsize=18, fontweight="bold", pad=15)
+    ax.set_xlabel("Date", fontsize=13)
+    ax.set_ylabel("Portfolio Value ($)", fontsize=13)
+    ax.legend(fontsize=12, loc="upper left", framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(labelsize=11)
+    # Annotate final values
+    for cum, lbl, color in [(cum_ls, "L/S", "#1f77b4"),
+                             (cum_long, "Long", "#2ca02c"),
+                             (cum_sp, "S&P", "#ff7f0e")]:
+        ax.annotate(f"${cum.iloc[-1]:.2f}", xy=(dates.iloc[-1], cum.iloc[-1]),
+                    fontsize=11, fontweight="bold", color=color,
+                    xytext=(10, 0), textcoords="offset points")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ppt_cumulative_growth.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: slide_deck/ppt_cumulative_growth.png")
+
+    # --- Chart 2: Rolling 12-Month Returns Comparison ---
+    fig, ax = plt.subplots(figsize=(14, 6))
+    roll_ls = strat_m["ls_ret"].rolling(12).apply(lambda x: (1+x).prod()-1, raw=True)
+    roll_long = strat_m["long_ret"].rolling(12).apply(lambda x: (1+x).prod()-1, raw=True)
+    roll_sp = strat_m["sp_ret"].rolling(12).apply(lambda x: (1+x).prod()-1, raw=True)
+    ax.plot(dates, roll_ls * 100, label="L/S Strategy", linewidth=2, color="#1f77b4")
+    ax.plot(dates, roll_long * 100, label="Long-Only", linewidth=1.5, color="#2ca02c", linestyle="--")
+    ax.plot(dates, roll_sp * 100, label="S&P 500", linewidth=1.5, color="#ff7f0e", linestyle="-.")
+    ax.axhline(y=0, color="black", linewidth=0.8)
+    ax.fill_between(dates, roll_ls * 100, 0, where=(roll_ls > 0), alpha=0.1, color="green")
+    ax.fill_between(dates, roll_ls * 100, 0, where=(roll_ls < 0), alpha=0.1, color="red")
+    ax.set_title("Rolling 12-Month Returns", fontsize=18, fontweight="bold", pad=15)
+    ax.set_xlabel("Date", fontsize=13)
+    ax.set_ylabel("Trailing 12-Month Return (%)", fontsize=13)
+    ax.legend(fontsize=12, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ppt_rolling_12m_returns.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: slide_deck/ppt_rolling_12m_returns.png")
+
+    # --- Chart 3: Annual Returns Bar Chart ---
+    strat_m_copy = strat_m.copy()
+    yearly = strat_m_copy.groupby("year").agg(
+        strategy=("ls_ret", lambda x: (1+x).prod()-1),
+        long_only=("long_ret", lambda x: (1+x).prod()-1),
+        sp500=("sp_ret", lambda x: (1+x).prod()-1),
+    ).reset_index()
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+    x = np.arange(len(yearly))
+    w = 0.25
+    bars1 = ax.bar(x - w, yearly["strategy"] * 100, w, label="L/S Strategy",
+                   color="#1f77b4", edgecolor="white", linewidth=0.5)
+    bars2 = ax.bar(x, yearly["long_only"] * 100, w, label="Long-Only",
+                   color="#2ca02c", edgecolor="white", linewidth=0.5)
+    bars3 = ax.bar(x + w, yearly["sp500"] * 100, w, label="S&P 500",
+                   color="#ff7f0e", edgecolor="white", linewidth=0.5)
+    ax.set_xticks(x)
+    ax.set_xticklabels(yearly["year"].astype(int), rotation=45, ha="right", fontsize=11)
+    ax.axhline(y=0, color="black", linewidth=0.8)
+    ax.set_title("Annual Returns Comparison", fontsize=18, fontweight="bold", pad=15)
+    ax.set_ylabel("Annual Return (%)", fontsize=13)
+    ax.legend(fontsize=12, framealpha=0.9)
+    ax.grid(True, alpha=0.3, axis="y")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ppt_annual_returns.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: slide_deck/ppt_annual_returns.png")
+
+    # --- Chart 4: Drawdown Comparison ---
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for ret_col, label, color in [("ls_ret", "L/S Strategy", "#1f77b4"),
+                                   ("long_ret", "Long-Only", "#2ca02c"),
+                                   ("sp_ret", "S&P 500", "#ff7f0e")]:
+        cum = (1 + strat_m[ret_col]).cumprod()
+        running_max = cum.cummax()
+        dd = (cum / running_max - 1) * 100
+        ax.plot(dates, dd, label=label, linewidth=1.5, color=color)
+        ax.fill_between(dates, dd, 0, alpha=0.1, color=color)
+    ax.set_title("Drawdown Comparison", fontsize=18, fontweight="bold", pad=15)
+    ax.set_xlabel("Date", fontsize=13)
+    ax.set_ylabel("Drawdown (%)", fontsize=13)
+    ax.legend(fontsize=12, framealpha=0.9)
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ppt_drawdowns.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: slide_deck/ppt_drawdowns.png")
+
+    # --- Chart 5: Risk-Return Scatter ---
+    fig, ax = plt.subplots(figsize=(8, 7))
+    portfolios = {
+        "L/S Strategy": ("ls_ret", "#1f77b4", "s", 200),
+        "Long-Only": ("long_ret", "#2ca02c", "^", 180),
+        "S&P 500": ("sp_ret", "#ff7f0e", "o", 180),
+    }
+    for name, (col, color, marker, size) in portfolios.items():
+        ann_ret = strat_m[col].mean() * 12 * 100
+        ann_std = strat_m[col].std() * np.sqrt(12) * 100
+        ax.scatter(ann_std, ann_ret, s=size, color=color, marker=marker,
+                   zorder=5, edgecolors="black", linewidth=0.8)
+        ax.annotate(f"  {name}\n  ({ann_ret:.1f}%, SR={ann_ret/ann_std:.2f})",
+                    (ann_std, ann_ret), fontsize=11, fontweight="bold", color=color)
+    ax.set_title("Risk-Return Profile", fontsize=18, fontweight="bold", pad=15)
+    ax.set_xlabel("Annualized Volatility (%)", fontsize=13)
+    ax.set_ylabel("Annualized Return (%)", fontsize=13)
+    ax.grid(True, alpha=0.3)
+    ax.axhline(y=0, color="grey", linewidth=0.5, linestyle=":")
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ppt_risk_return.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: slide_deck/ppt_risk_return.png")
+
+    # --- Chart 6: Monthly Return Distribution ---
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5), sharey=True)
+    for ax, (col, label, color) in zip(axes, [
+        ("ls_ret", "L/S Strategy", "#1f77b4"),
+        ("long_ret", "Long-Only", "#2ca02c"),
+        ("sp_ret", "S&P 500", "#ff7f0e"),
+    ]):
+        data = strat_m[col] * 100
+        ax.hist(data, bins=30, color=color, edgecolor="white", alpha=0.8)
+        ax.axvline(data.mean(), color="black", linestyle="--", linewidth=1.5,
+                   label=f"Mean={data.mean():.2f}%")
+        ax.set_title(label, fontsize=14, fontweight="bold")
+        ax.set_xlabel("Monthly Return (%)", fontsize=11)
+        ax.legend(fontsize=10)
+        ax.grid(True, alpha=0.3, axis="y")
+    axes[0].set_ylabel("Frequency", fontsize=11)
+    fig.suptitle("Monthly Return Distributions", fontsize=18, fontweight="bold", y=1.02)
+    plt.tight_layout()
+    plt.savefig(os.path.join(out_dir, "ppt_return_distributions.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved: slide_deck/ppt_return_distributions.png")
+
+    print(f"\n  All PPT charts saved to: {out_dir}/")
+
+
+# ===========================================================================
 #  MAIN
 # ===========================================================================
 
@@ -952,7 +1121,7 @@ if __name__ == "__main__":
 
     # --- Step 2: Full evaluation with best config ---
     n_long, n_short, scheme = best_config
-    holdings, strat, metrics = full_evaluation(
+    holdings, trades_df, strat, metrics = full_evaluation(
         pred, mkt, model, n_long, n_short, scheme)
 
     # --- Step 3: Generate all slide deck outputs ---
@@ -962,6 +1131,12 @@ if __name__ == "__main__":
     generate_slide_deck_outputs(
         pred, holdings, strat, metrics, mkt,
         model, n_long, n_short, scheme)
+
+    # --- Step 4: Generate nice comparison charts for PPT ---
+    print(f"\n{'='*60}")
+    print("GENERATING COMPARISON CHARTS FOR PPT")
+    print(f"{'='*60}")
+    generate_ppt_charts(strat, metrics, mkt, model, n_long, n_short, scheme)
 
     print(f"\n{'='*60}")
     print("Done! All outputs for the 5-page slide deck are in output/slide_deck/")
