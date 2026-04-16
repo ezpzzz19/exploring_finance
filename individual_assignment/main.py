@@ -64,6 +64,7 @@ def xgb_predict(X_train, Y_train_dm, X_val, Y_val_dm, X_test):
     """
     XGBoost with hyperparameter grid search over learning rate and max_depth,
     following the tree.py pattern from the labs.
+    Returns (predictions, feature_importances_dict).
     """
     # Grid search over learning rate (10^lambda) and tree depth
     lambdas = np.arange(-2, -0.9, 1)          # 0.01, 0.1
@@ -77,12 +78,12 @@ def xgb_predict(X_train, Y_train_dm, X_val, Y_val_dm, X_test):
                 n_estimators=n_trees, max_depth=j,
                 learning_rate=(10 ** i), tree_method='hist',
                 reg_alpha=0, reg_lambda=0, random_state=SEED,
+                callbacks=[xgb.callback.EarlyStopping(rounds=15, save_best=True)],
             )
-            callbacks = [xgb.callback.EarlyStopping(rounds=15, save_best=True)]
             model.fit(
                 X_train, Y_train_dm,
                 eval_set=[(X_val, Y_val_dm)],
-                callbacks=callbacks, verbose=False,
+                verbose=False,
             )
             val_mse[ind, jnd] = mean_squared_error(
                 Y_val_dm, model.predict(X_val)
@@ -98,14 +99,14 @@ def xgb_predict(X_train, Y_train_dm, X_val, Y_val_dm, X_test):
         n_estimators=n_trees, max_depth=best_depth,
         learning_rate=best_lr, tree_method='hist',
         reg_alpha=0, reg_lambda=0, random_state=SEED,
+        callbacks=[xgb.callback.EarlyStopping(rounds=15, save_best=True)],
     )
-    callbacks = [xgb.callback.EarlyStopping(rounds=15, save_best=True)]
     model.fit(
         X_train, Y_train_dm,
         eval_set=[(X_val, Y_val_dm)],
-        callbacks=callbacks, verbose=False,
+        verbose=False,
     )
-    return model.predict(X_test)
+    return model.predict(X_test), model.feature_importances_
 
 
 # ===========================================================================
@@ -311,10 +312,7 @@ def load_and_preprocess(data_dir):
     return data, stock_vars, mkt
 
 
-# ===========================================================================
 #  EXPANDING-WINDOW ENSEMBLE  (XGBoost + Autoencoder)
-# ===========================================================================
-
 def run_ensemble_stage(data, stock_vars):
     print("ENSEMBLE  (XGBoost + Autoencoder)", flush=True)
 
@@ -341,6 +339,7 @@ def run_ensemble_stage(data, stock_vars):
     starting = pd.to_datetime("2000-01-01")
     counter = 0
     pred_out = pd.DataFrame()
+    all_feat_imp = []
 
     while (starting + pd.DateOffset(years=11 + counter)) <= pd.to_datetime("2024-01-01"):
         cutoff = [
@@ -383,12 +382,14 @@ def run_ensemble_stage(data, stock_vars):
 
         # (A) XGBoost
         print("    XGBoost...", flush=True)
-        xgb_p = xgb_predict(
+        xgb_p, feat_imp = xgb_predict(
             X_train=X_train_sc, Y_train_dm=Y_train_dm,
             X_val=X_val_sc, Y_val_dm=Y_val_dm,
             X_test=X_test_sc,
-        ) + Y_mean
+        )
+        xgb_p = xgb_p + Y_mean
         reg_pred["xgb"] = xgb_p
+        all_feat_imp.append(feat_imp)
         print("    XGBoost done", flush=True)
 
         # (B) Autoencoder
@@ -421,10 +422,22 @@ def run_ensemble_stage(data, stock_vars):
         counter += 1
         gc.collect()
 
+    # --- Save XGBoost feature importances (Slide 3 & 5) ---
+    if all_feat_imp:
+        avg_imp = np.mean(np.vstack(all_feat_imp), axis=0)
+        feat_df = pd.DataFrame({"feature": stock_vars, "importance": avg_imp})
+        feat_df = feat_df.sort_values("importance", ascending=False).reset_index(drop=True)
+        os.makedirs("output", exist_ok=True)
+        feat_df.to_csv("output/xgb_feature_importance.csv", index=False)
+        print(f"\n  Top 20 XGBoost features (avg across windows):", flush=True)
+        for _, row in feat_df.head(20).iterrows():
+            print(f"    {row['feature']:30s}  {row['importance']:.6f}", flush=True)
+
     # OOS R-squared
     print(f"\n{'-'*60}", flush=True)
     print("OOS R-squared (benchmark = 0):", flush=True)
     yreal = pred_out[ret_var].values
+    r2_records = []
     for mn in ["xgb", "ae", "ensemble"]:
         yp = pred_out[mn].values
         mask = ~np.isnan(yp)
@@ -433,6 +446,23 @@ def run_ensemble_stage(data, stock_vars):
             continue
         r2 = 1 - np.sum((yreal[mask] - yp[mask])**2) / np.sum(yreal[mask]**2)
         print(f"  {mn:10s}  R2 = {r2:.6f}  ({r2*100:.4f}%)", flush=True)
+        r2_records.append({"model": mn, "oos_r2": r2, "oos_r2_pct": r2 * 100})
+
+    # --- Save OOS R² by year for each model (Slide 3) ---
+    r2_by_year = []
+    for mn in ["xgb", "ae", "ensemble"]:
+        yp = pred_out[mn].values
+        for yr in sorted(pred_out["year"].unique()):
+            mask_yr = (pred_out["year"].values == yr) & ~np.isnan(yp)
+            if mask_yr.sum() == 0:
+                continue
+            r2_yr = 1 - np.sum((yreal[mask_yr] - yp[mask_yr])**2) / np.sum(yreal[mask_yr]**2)
+            r2_by_year.append({"model": mn, "year": yr, "oos_r2": r2_yr, "oos_r2_pct": r2_yr * 100})
+
+    os.makedirs("output", exist_ok=True)
+    pd.DataFrame(r2_records).to_csv("output/oos_r2_overall.csv", index=False)
+    pd.DataFrame(r2_by_year).to_csv("output/oos_r2_by_year.csv", index=False)
+    print("  Saved: output/oos_r2_overall.csv, output/oos_r2_by_year.csv", flush=True)
 
     return pred_out
 

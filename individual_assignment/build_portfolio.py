@@ -472,405 +472,451 @@ def full_evaluation(pred, mkt, model, n_long, n_short, scheme):
     return holdings, trades_df, strat_m, metrics
 
 
-# ===========================================================================
-#  MAIN
-# ===========================================================================
-
-if __name__ == "__main__":
-    print("="*60)
-    print("Portfolio Construction & Sharpe Optimization")
-    print("="*60)
-
-    pred_path = os.path.join(os.path.dirname(__file__), "output", "predictions.csv")
-    if not os.path.exists(pred_path):
-        print(f"ERROR: {pred_path} not found. Run main.py first.")
-        sys.exit(1)
-
-    pred = pd.read_csv(pred_path, parse_dates=["date"])
-    print(f"Loaded {len(pred):,} predictions")
-    print(f"  Date range: {pred['date'].min()} to {pred['date'].max()}")
-
-    mkt_path = os.path.join(os.path.dirname(__file__), "data_we", "mkt_ind.csv")
-    mkt = pd.read_csv(mkt_path)
-
-    model = "ensemble"
-
-    # Step 1: Grid search
-    grid_df, best_config = grid_search_sharpe(pred, mkt, model=model)
-    grid_df.to_csv(os.path.join(os.path.dirname(__file__),
-                                "output", "sharpe_grid.csv"), index=False)
-
-    # Step 2: Full evaluation with best config
-    n_long, n_short, scheme = best_config
-    holdings, trades_df, strat, metrics = full_evaluation(
-        pred, mkt, model, n_long, n_short, scheme)
-
-    print(f"\n{'='*60}")
-    print("Done!")
-
-
-import os
-import sys
-import warnings
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import statsmodels.formula.api as smf
-from pandas.tseries.offsets import MonthBegin
-
-warnings.filterwarnings("ignore")
-
-# ===========================================================================
-#  WEIGHTING SCHEMES
-# ===========================================================================
-
-def equal_weight(group, model, n_long, n_short):
-    """Equal weight: 1/n_long for longs, -1/n_short for shorts."""
-    sg = group.sort_values(model, ascending=False)
-    top = sg.head(n_long).copy()
-    bottom = sg.tail(n_short).copy()
-    top["weight"] = 1.0 / n_long
-    top["side"] = "long"
-    bottom["weight"] = -1.0 / n_short
-    bottom["side"] = "short"
-    return pd.concat([top, bottom], ignore_index=True)
-
-
-def signal_weight(group, model, n_long, n_short):
-    """Weight proportional to |predicted return| signal strength."""
-    sg = group.sort_values(model, ascending=False)
-    top = sg.head(n_long).copy()
-    bottom = sg.tail(n_short).copy()
-
-    # Long weights: proportional to predicted return (higher = more weight)
-    long_signals = top[model].values - top[model].values.min() + 1e-8
-    long_signals = long_signals / long_signals.sum()
-    top["weight"] = long_signals
-    top["side"] = "long"
-
-    # Short weights: proportional to how negative the prediction is
-    short_signals = bottom[model].values.max() - bottom[model].values + 1e-8
-    short_signals = short_signals / short_signals.sum()
-    bottom["weight"] = -short_signals
-    bottom["side"] = "short"
-
-    return pd.concat([top, bottom], ignore_index=True)
-
-
-def rank_weight(group, model, n_long, n_short):
-    """Weight proportional to rank within the selected stocks."""
-    sg = group.sort_values(model, ascending=False)
-    top = sg.head(n_long).copy()
-    bottom = sg.tail(n_short).copy()
-
-    # Long: rank 1 gets highest weight
-    long_ranks = np.arange(n_long, 0, -1, dtype=float)
-    long_ranks = long_ranks / long_ranks.sum()
-    top["weight"] = long_ranks
-    top["side"] = "long"
-
-    # Short: last rank gets highest (most negative) weight
-    short_ranks = np.arange(1, n_short + 1, dtype=float)
-    short_ranks = short_ranks / short_ranks.sum()
-    bottom["weight"] = -short_ranks
-    bottom["side"] = "short"
-
-    return pd.concat([top, bottom], ignore_index=True)
-
-
-WEIGHT_SCHEMES = {
-    "equal": equal_weight,
-    "signal": signal_weight,
-    "rank": rank_weight,
-}
 
 
 # ===========================================================================
-#  BUILD PORTFOLIO FOR ONE CONFIG
+#  SLIDE DECK OUTPUTS  — generates all files needed for 5-page deck
 # ===========================================================================
 
-def build_portfolio(pred, model, n_long, n_short, scheme="equal"):
+def generate_slide_deck_outputs(pred, holdings, strat_m, metrics, mkt,
+                                model, n_long, n_short, scheme):
     """
-    Build month-by-month portfolio.
-    Returns:
-      holdings_df: every stock, every month, with weight, side, realized return
-      strat_df:    monthly strategy returns
+    Generate all CSV/PNG/TXT files needed for the slide deck.
+    Outputs go to output/slide_deck/.
     """
     ret_var = "stock_exret"
-    weight_fn = WEIGHT_SCHEMES[scheme]
+    out_dir = os.path.join(os.path.dirname(__file__), "output", "slide_deck")
+    os.makedirs(out_dir, exist_ok=True)
 
-    all_holdings = []
-    monthly_returns = []
+    # ---------------------------------------------------------------
+    # SLIDE 1: Executive Summary
+    # ---------------------------------------------------------------
+    sp_mean = strat_m["sp_ret"].mean() * 12
+    sp_std = strat_m["sp_ret"].std() * np.sqrt(12)
+    sp_sharpe = strat_m["sp_ret"].mean() / strat_m["sp_ret"].std() * np.sqrt(12)
+    strat_ann_ret = metrics["mean_ret_monthly"] * 12
+    strat_ann_std = metrics["std_ret_monthly"] * np.sqrt(12)
 
-    for (yr, mo), group in pred.groupby(["year", "month"]):
-        h = weight_fn(group, model, n_long, n_short)
-        h = h[["year", "month", "date", "permno", model,
-               ret_var, "weight", "side"]].copy()
+    summary_lines = [
+        "EXECUTIVE SUMMARY",
+        "=" * 60,
+        "",
+        "Strategy: Ensemble Alpha Long-Short",
+        f"  ML Models: XGBoost (gradient boosted trees) + Autoencoder (conditional factor model)",
+        f"  Signal: Equal-weight average of XGBoost and Autoencoder predicted returns",
+        f"  Portfolio: Long top {n_long} / Short bottom {n_short} stocks, "
+        f"{scheme}-weighted, monthly rebalance",
+        f"  Universe: ~1,000 large-cap US equities (above NYSE median market cap)",
+        f"  OOS Period: {strat_m['date_plot'].min().strftime('%Y-%m')} to "
+        f"{strat_m['date_plot'].max().strftime('%Y-%m')} ({metrics['months']} months)",
+        "",
+        "Performance vs S&P 500:",
+        f"  {'Metric':<35s} {'Strategy':>12s} {'S&P 500':>12s}",
+        f"  {'-'*59}",
+        f"  {'Avg Annualized Return':<35s} {strat_ann_ret*100:>11.2f}% {sp_mean*100:>11.2f}%",
+        f"  {'Annualized Std Dev':<35s} {strat_ann_std*100:>11.2f}% {sp_std*100:>11.2f}%",
+        f"  {'Annualized Sharpe Ratio':<35s} {metrics['sharpe']:>12.3f} {sp_sharpe:>12.3f}",
+        f"  {'Annualized Alpha (CAPM)':<35s} {metrics['alpha_annual']*100:>11.2f}%        {'N/A':>6s}",
+        "",
+        f"  Final cumulative value of $1:",
+        f"    Strategy:  ${strat_m['cum_ls'].iloc[-1]:.2f}" if 'cum_ls' in strat_m.columns
+        else f"    Strategy:  ${(1+strat_m['ls_ret']).cumprod().iloc[-1]:.2f}",
+        f"    S&P 500:   ${strat_m['cum_sp500'].iloc[-1]:.2f}" if 'cum_sp500' in strat_m.columns
+        else f"    S&P 500:   ${(1+strat_m['sp_ret']).cumprod().iloc[-1]:.2f}",
+    ]
+    with open(os.path.join(out_dir, "slide1_executive_summary.txt"), "w") as f:
+        f.write("\n".join(summary_lines))
+    print(f"  Saved: slide_deck/slide1_executive_summary.txt")
 
-        # Weighted return: sum(w_i * r_i) for longs, sum(|w_i| * r_i) for shorts
-        long_h = h[h["side"] == "long"]
-        short_h = h[h["side"] == "short"]
+    # ---------------------------------------------------------------
+    # SLIDE 2: Strategy Description, Top 10 Holdings, Cumulative Plot
+    # ---------------------------------------------------------------
+    # Top 10 average holdings by weight across OOS
+    long_holdings = holdings[holdings["side"] == "long"].copy()
+    avg_holdings = (long_holdings.groupby("permno")
+                    .agg(avg_weight=("weight", "mean"),
+                         avg_pred=(model, "mean"),
+                         avg_realized=(ret_var, "mean"),
+                         months_held=("weight", "count"))
+                    .reset_index()
+                    .sort_values("avg_weight", ascending=False))
+    top10 = avg_holdings.head(10)
+    top10.to_csv(os.path.join(out_dir, "slide2_top10_holdings.csv"), index=False)
+    print(f"  Saved: slide_deck/slide2_top10_holdings.csv")
 
-        long_ret = (long_h["weight"] * long_h[ret_var]).sum()
-        short_ret = (short_h["weight"].abs() * short_h[ret_var]).sum()
-        ls_ret = long_ret - short_ret
+    # Also save top 10 short
+    short_holdings = holdings[holdings["side"] == "short"].copy()
+    avg_short = (short_holdings.groupby("permno")
+                 .agg(avg_weight=("weight", "mean"),
+                      avg_pred=(model, "mean"),
+                      avg_realized=(ret_var, "mean"),
+                      months_held=("weight", "count"))
+                 .reset_index()
+                 .sort_values("avg_weight", ascending=True))
+    top10_short = avg_short.head(10)
+    top10_short.to_csv(os.path.join(out_dir, "slide2_top10_short_holdings.csv"), index=False)
+    print(f"  Saved: slide_deck/slide2_top10_short_holdings.csv")
 
-        monthly_returns.append({
-            "year": yr, "month": mo,
-            "long_ret": long_ret,
-            "short_ret": short_ret,
-            "ls_ret": ls_ret,
-            "n_long": len(long_h),
-            "n_short": len(short_h),
-        })
-        all_holdings.append(h)
+    # Strategy description
+    strat_desc = [
+        "INVESTMENT STRATEGY",
+        "=" * 60,
+        "",
+        "Type: Long-Short (dollar-neutral)",
+        f"  Long:  Top {n_long} stocks by predicted return ({scheme}-weighted)",
+        f"  Short: Bottom {n_short} stocks by predicted return ({scheme}-weighted)",
+        f"  Total holdings: {n_long + n_short} stocks per month",
+        f"  Rebalance: Monthly",
+        "",
+        "Predictive Signal: Ensemble average of:",
+        "  1. XGBoost - gradient boosted trees on 147+ stock characteristics",
+        "  2. Autoencoder - conditional factor model via managed portfolios",
+        "",
+        "Top 10 Long Holdings (avg over OOS period):",
+        f"  {'permno':>8s}  {'avg_weight':>10s}  {'avg_pred':>10s}  {'avg_realized':>12s}  {'months':>6s}",
+    ]
+    for _, r in top10.iterrows():
+        strat_desc.append(
+            f"  {int(r['permno']):>8d}  {r['avg_weight']:>10.4f}  "
+            f"{r['avg_pred']:>+10.6f}  {r['avg_realized']:>+12.6f}  {int(r['months_held']):>6d}")
+    strat_desc += [
+        "",
+        "Top 10 Short Holdings (avg over OOS period):",
+        f"  {'permno':>8s}  {'avg_weight':>10s}  {'avg_pred':>10s}  {'avg_realized':>12s}  {'months':>6s}",
+    ]
+    for _, r in top10_short.iterrows():
+        strat_desc.append(
+            f"  {int(r['permno']):>8d}  {r['avg_weight']:>10.4f}  "
+            f"{r['avg_pred']:>+10.6f}  {r['avg_realized']:>+12.6f}  {int(r['months_held']):>6d}")
 
-    holdings_df = pd.concat(all_holdings, ignore_index=True)
-    strat_df = pd.DataFrame(monthly_returns)
-    return holdings_df, strat_df
+    with open(os.path.join(out_dir, "slide2_strategy_description.txt"), "w") as f:
+        f.write("\n".join(strat_desc))
+    print(f"  Saved: slide_deck/slide2_strategy_description.txt")
 
+    # ---------------------------------------------------------------
+    # SLIDE 3: Data & Methodology, OOS R²
+    # ---------------------------------------------------------------
+    # Copy OOS R² files if they exist
+    r2_overall_path = os.path.join(os.path.dirname(__file__), "output", "oos_r2_overall.csv")
+    r2_by_year_path = os.path.join(os.path.dirname(__file__), "output", "oos_r2_by_year.csv")
+    feat_imp_path = os.path.join(os.path.dirname(__file__), "output", "xgb_feature_importance.csv")
 
-# ===========================================================================
-#  COMPUTE METRICS
-# ===========================================================================
+    methodology_lines = [
+        "DATA & METHODOLOGY",
+        "=" * 60,
+        "",
+        "Data:",
+        "  Source: mma_sample_v2.csv (Jensen, Kelly, Pedersen 2022) + WRDS Financial Ratios Suite",
+        "  Universe: U.S. common shares above NYSE median market cap",
+        "  Period: Jan 2000 - Dec 2023 (monthly)",
+        "  Characteristics: 147+ firm-specific predictors (fundamentals, momentum, liquidity, etc.)",
+        "  Preprocessing: Cross-sectional rank transform to [-1, 1] each month",
+        "",
+        "ML Models:",
+        "  1. XGBoost (Gradient Boosted Trees)",
+        "     - Grid search: learning rate {0.01, 0.1}, max depth {1, 2}",
+        "     - Early stopping on validation set (15 rounds patience)",
+        "     - n_estimators=1000, hist tree method",
+        "",
+        "  2. Autoencoder (Gu, Kelly & Xiu 2021)",
+        "     - Conditional factor model with managed portfolios",
+        "     - Architecture: input -> 32 hidden -> K factors (K=6)",
+        "     - 3-model ensemble, L1 regularization, Adam optimizer",
+        "     - Early stopping (5 epochs patience), batch size=1000",
+        "",
+        "  Ensemble: Equal-weight average of XGBoost + Autoencoder predictions",
+        "",
+        "Training Procedure (Expanding Window):",
+        "  - Initial training: 2000-2007 (8 years)",
+        "  - Initial validation: 2008-2009 (2 years)",
+        "  - First OOS test: 2010 (1 year)",
+        "  - Expand training by 1 year, roll validation by 1 year, repeat",
+        "  - Final OOS predictions: 2010-2023 (14 years, 168 months)",
+        "",
+    ]
 
-def compute_metrics(strat, mkt):
-    """Compute Sharpe, alpha, drawdown, turnover-ready stats."""
-    strat = strat.merge(mkt, on=["year", "month"], how="inner")
-    strat["mkt_rf"] = strat["sp_ret"] - strat["rf"]
+    # Append OOS R² if available
+    if os.path.exists(r2_overall_path):
+        r2_df = pd.read_csv(r2_overall_path)
+        methodology_lines.append("OOS R² (benchmark = 0, i.e. no predictability):")
+        for _, r in r2_df.iterrows():
+            methodology_lines.append(f"  {r['model']:12s}  R² = {r['oos_r2']:.6f}  ({r['oos_r2_pct']:.4f}%)")
+        methodology_lines.append("")
 
-    T = len(strat)
-    if T < 3:
-        return {"sharpe": np.nan, "alpha": np.nan, "alpha_t": np.nan,
-                "ir": np.nan, "max_dd": np.nan, "months": T}
+    # Append top features if available
+    if os.path.exists(feat_imp_path):
+        feat_df = pd.read_csv(feat_imp_path)
+        methodology_lines.append("Top 20 Predictive Features (XGBoost avg importance):")
+        for i, (_, r) in enumerate(feat_df.head(20).iterrows()):
+            methodology_lines.append(f"  {i+1:>2d}. {r['feature']:30s}  {r['importance']:.6f}")
 
-    mr = strat["ls_ret"].mean()
-    sd = strat["ls_ret"].std()
-    sharpe = mr / sd * np.sqrt(12) if sd > 0 else 0.0
+    with open(os.path.join(out_dir, "slide3_methodology.txt"), "w") as f:
+        f.write("\n".join(methodology_lines))
+    print(f"  Saved: slide_deck/slide3_methodology.txt")
 
-    nw = smf.ols(formula="ls_ret ~ mkt_rf", data=strat).fit(
-        cov_type="HAC", cov_kwds={"maxlags": 6}, use_t=True)
-    alpha = nw.params["Intercept"]
-    alpha_t = nw.tvalues["Intercept"]
-    beta = nw.params["mkt_rf"]
-    ir = alpha / np.sqrt(nw.mse_resid) * np.sqrt(12)
+    # Save OOS R² by year plot if data available
+    if os.path.exists(r2_by_year_path):
+        r2_yr = pd.read_csv(r2_by_year_path)
+        fig_r2, ax_r2 = plt.subplots(figsize=(12, 5))
+        for mn in r2_yr["model"].unique():
+            sub = r2_yr[r2_yr["model"] == mn]
+            ax_r2.bar(sub["year"] + {"xgb": -0.25, "ae": 0.0, "ensemble": 0.25}.get(mn, 0),
+                      sub["oos_r2_pct"], width=0.25, label=mn, alpha=0.8)
+        ax_r2.set_xlabel("Year")
+        ax_r2.set_ylabel("OOS R² (%)")
+        ax_r2.set_title("Out-of-Sample R² by Year and Model")
+        ax_r2.legend()
+        ax_r2.axhline(y=0, color="black", linewidth=0.5)
+        ax_r2.grid(True, alpha=0.3, axis="y")
+        plt.tight_layout()
+        plt.savefig(os.path.join(out_dir, "slide3_oos_r2_by_year.png"), dpi=150)
+        print(f"  Saved: slide_deck/slide3_oos_r2_by_year.png")
 
-    strat["log_ret"] = np.log(strat["ls_ret"] + 1)
-    strat["cum_log"] = strat["log_ret"].cumsum()
-    peak = strat["cum_log"].cummax()
-    max_dd = (peak - strat["cum_log"]).max()
+    # ---------------------------------------------------------------
+    # SLIDE 4: Portfolio Performance Statistics (full comparison table)
+    # ---------------------------------------------------------------
+    # S&P 500 metrics
+    sp_cum = (1 + strat_m["sp_ret"]).cumprod()
+    sp_log = np.log(1 + strat_m["sp_ret"]).cumsum()
+    sp_peak = sp_log.cummax()
+    sp_max_dd = (sp_peak - sp_log).max()
+    sp_max_1m = strat_m["sp_ret"].min()
 
-    return {
-        "sharpe": sharpe,
-        "mean_ret_monthly": mr,
-        "std_ret_monthly": sd,
-        "alpha_monthly": alpha,
-        "alpha_annual": alpha * 12,
-        "alpha_t": alpha_t,
-        "beta": beta,
-        "ir": ir,
-        "max_dd": max_dd,
-        "max_1m_loss": strat["ls_ret"].min(),
-        "months": T,
-    }
-
-
-# ===========================================================================
-#  GRID SEARCH FOR OPTIMAL SHARPE
-# ===========================================================================
-
-def grid_search_sharpe(pred, mkt, model="ensemble"):
-    """
-    Search over n_long, n_short, and weighting scheme
-    to find the Sharpe-maximizing configuration.
-    """
-    print("\n" + "="*60)
-    print("GRID SEARCH: Maximizing Sharpe Ratio")
-    print("="*60)
-
-    # Grid: number of long/short positions
-    n_longs = [20, 30, 40, 50, 60, 80, 100]
-    n_shorts = [10, 20, 30, 40, 50, 60]
-    schemes = ["equal", "signal", "rank"]
-
-    results = []
-    best_sharpe = -999
-    best_config = None
-
-    total = len(n_longs) * len(n_shorts) * len(schemes)
-    i = 0
-
-    for scheme in schemes:
-        for nl in n_longs:
-            for ns in n_shorts:
-                i += 1
-                _, strat = build_portfolio(pred, model, nl, ns, scheme)
-                metrics = compute_metrics(strat.copy(), mkt)
-                sharpe = metrics["sharpe"]
-
-                results.append({
-                    "n_long": nl, "n_short": ns, "scheme": scheme,
-                    "sharpe": sharpe,
-                    "alpha_annual": metrics.get("alpha_annual", np.nan),
-                    "alpha_t": metrics.get("alpha_t", np.nan),
-                    "max_dd": metrics.get("max_dd", np.nan),
-                })
-
-                if not np.isnan(sharpe) and sharpe > best_sharpe:
-                    best_sharpe = sharpe
-                    best_config = (nl, ns, scheme)
-
-                if i % 21 == 0:
-                    print(f"  {i}/{total} configs tested...", flush=True)
-
-    grid_df = pd.DataFrame(results)
-    print(f"\n  All {total} configs tested.", flush=True)
-    print(f"\n  BEST CONFIG: n_long={best_config[0]}, "
-          f"n_short={best_config[1]}, scheme={best_config[2]}")
-    print(f"  BEST SHARPE: {best_sharpe:.3f}")
-
-    # Show top 10
-    top10 = grid_df.nlargest(10, "sharpe")
-    print(f"\n  Top 10 configurations:")
-    print(top10.to_string(index=False))
-
-    return grid_df, best_config
-
-
-# ===========================================================================
-#  FULL EVALUATION WITH BEST CONFIG
-# ===========================================================================
-
-def full_evaluation(pred, mkt, model, n_long, n_short, scheme):
-    """Run full evaluation and save all outputs."""
-    print(f"\n{'='*60}")
-    print(f"FINAL PORTFOLIO  (n_long={n_long}, n_short={n_short}, "
-          f"scheme={scheme})")
-    print(f"{'='*60}")
-
-    ret_var = "stock_exret"
-    holdings, strat = build_portfolio(pred, model, n_long, n_short, scheme)
-    strat_m = strat.merge(mkt, on=["year", "month"], how="inner")
-    strat_m["mkt_rf"] = strat_m["sp_ret"] - strat_m["rf"]
-
-    metrics = compute_metrics(strat.copy(), mkt)
-
-    # Print results
-    print(f"\n  Months: {metrics['months']}")
-    print(f"  Mean monthly return:  {metrics['mean_ret_monthly']*100:.3f}%")
-    print(f"  Std monthly return:   {metrics['std_ret_monthly']*100:.3f}%")
-    print(f"  Annualized Sharpe:    {metrics['sharpe']:.3f}")
-    print(f"\n  CAPM Alpha (monthly): {metrics['alpha_monthly']*100:.3f}%  "
-          f"(t={metrics['alpha_t']:.2f})")
-    print(f"  CAPM Alpha (annual):  {metrics['alpha_annual']*100:.3f}%")
-    print(f"  CAPM Beta:            {metrics['beta']:.3f}")
-    print(f"  Information Ratio:    {metrics['ir']:.3f}")
-    print(f"\n  Max 1-month loss:     {metrics['max_1m_loss']*100:.3f}%")
-    print(f"  Maximum Drawdown:     {metrics['max_dd']*100:.3f}%")
+    # Long-only metrics for comparison
+    long_mean = strat_m["long_ret"].mean()
+    long_std = strat_m["long_ret"].std()
+    long_sharpe = long_mean / long_std * np.sqrt(12) if long_std > 0 else 0
+    long_log = np.log(1 + strat_m["long_ret"]).cumsum()
+    long_peak = long_log.cummax()
+    long_max_dd = (long_peak - long_log).max()
 
     # Turnover
-    long_h = holdings[holdings["side"] == "long"]
-    short_h = holdings[holdings["side"] == "short"]
+    long_h_df = holdings[holdings["side"] == "long"]
+    short_h_df = holdings[holdings["side"] == "short"]
 
-    def calc_turnover(df):
-        start = df[["permno", "date"]].sort_values(["date", "permno"])
-        sc = start.groupby("date")["permno"].count().reset_index()
-        end = df[["permno", "date"]].copy()
-        end["date"] = end["date"] - MonthBegin(1)
-        end = end.sort_values(["date", "permno"])
-        remain = start.merge(end, on=["date", "permno"], how="inner")
-        rc = remain.groupby("date")["permno"].count().reset_index()
-        rc = rc.rename(columns={"permno": "remain"})
-        m = sc.merge(rc, on="date", how="inner")
-        m["turnover"] = (m["permno"] - m["remain"]) / m["permno"]
-        return m["turnover"].mean()
+    def calc_turnover_pct(df):
+        months = sorted(df[["year", "month"]].drop_duplicates().itertuples(
+            index=False, name=None))
+        prev_set = set()
+        turnovers = []
+        for yr, mo in months:
+            cur_set = set(df[(df["year"] == yr) & (df["month"] == mo)]["permno"])
+            if prev_set:
+                new = len(cur_set - prev_set)
+                turnovers.append(new / len(cur_set) if len(cur_set) > 0 else 0)
+            prev_set = cur_set
+        return np.mean(turnovers) if turnovers else 0
 
-    l_to = calc_turnover(long_h)
-    s_to = calc_turnover(short_h)
-    print(f"\n  Long turnover:        {l_to*100:.1f}%")
-    print(f"  Short turnover:       {s_to*100:.1f}%")
+    l_turnover = calc_turnover_pct(long_h_df)
+    s_turnover = calc_turnover_pct(short_h_df)
+    total_turnover = (l_turnover * n_long + s_turnover * n_short) / (n_long + n_short)
 
-    # Long-only
-    print(f"\n  --- Long-only portfolio (top {n_long}) ---")
-    lm = strat_m["long_ret"].mean()
-    ls_std = strat_m["long_ret"].std()
-    print(f"  Mean monthly return:  {lm*100:.3f}%")
-    print(f"  Annualized Sharpe:    {lm/ls_std*np.sqrt(12):.3f}")
+    perf_table = pd.DataFrame({
+        "Metric": [
+            "Avg Annualized Return",
+            "Annualized Std Dev",
+            "Annualized Sharpe Ratio",
+            "Annualized Alpha (CAPM)",
+            "Alpha t-stat",
+            "CAPM Beta",
+            "Annualized Information Ratio",
+            "Maximum Drawdown",
+            "Maximum 1-Month Loss",
+            "Portfolio Turnover (monthly avg)",
+            "Months",
+        ],
+        "Strategy (L/S)": [
+            f"{strat_ann_ret*100:.2f}%",
+            f"{strat_ann_std*100:.2f}%",
+            f"{metrics['sharpe']:.3f}",
+            f"{metrics['alpha_annual']*100:.2f}%",
+            f"{metrics['alpha_t']:.2f}",
+            f"{metrics['beta']:.3f}",
+            f"{metrics['ir']:.3f}",
+            f"{metrics['max_dd']*100:.2f}%",
+            f"{metrics['max_1m_loss']*100:.2f}%",
+            f"{total_turnover*100:.1f}%",
+            f"{metrics['months']}",
+        ],
+        "Long-Only": [
+            f"{long_mean*12*100:.2f}%",
+            f"{long_std*np.sqrt(12)*100:.2f}%",
+            f"{long_sharpe:.3f}",
+            "N/A",
+            "N/A",
+            "N/A",
+            "N/A",
+            f"{long_max_dd*100:.2f}%",
+            f"{strat_m['long_ret'].min()*100:.2f}%",
+            f"{l_turnover*100:.1f}%",
+            f"{len(strat_m)}",
+        ],
+        "S&P 500": [
+            f"{sp_mean*100:.2f}%",
+            f"{sp_std*100:.2f}%",
+            f"{sp_sharpe:.3f}",
+            "N/A (benchmark)",
+            "N/A",
+            "1.000",
+            "N/A",
+            f"{sp_max_dd*100:.2f}%",
+            f"{sp_max_1m*100:.2f}%",
+            "N/A",
+            f"{len(strat_m)}",
+        ],
+    })
+    perf_table.to_csv(os.path.join(out_dir, "slide4_performance_table.csv"), index=False)
+    print(f"  Saved: slide_deck/slide4_performance_table.csv")
 
-    # --- CAPM regression ---
-    nw = smf.ols(formula="ls_ret ~ mkt_rf", data=strat_m).fit(
-        cov_type="HAC", cov_kwds={"maxlags": 6}, use_t=True)
-    print(f"\n{nw.summary()}")
+    # Also save as formatted text
+    with open(os.path.join(out_dir, "slide4_performance_stats.txt"), "w") as f:
+        f.write("PORTFOLIO PERFORMANCE STATISTICS\n")
+        f.write(f"OOS Period: {strat_m['date_plot'].min().strftime('%Y-%m')} to "
+                f"{strat_m['date_plot'].max().strftime('%Y-%m')}\n")
+        f.write("=" * 80 + "\n\n")
+        f.write(perf_table.to_string(index=False))
+        f.write("\n")
+    print(f"  Saved: slide_deck/slide4_performance_stats.txt")
 
-    # --- Save outputs ---
-    os.makedirs("output", exist_ok=True)
+    # ---------------------------------------------------------------
+    # SLIDE 5: Discussion — top contributing stocks, yearly performance
+    # ---------------------------------------------------------------
+    # Top 10 most profitable long positions
+    long_contrib = (long_h_df.groupby("permno")
+                    .agg(total_contrib=(ret_var, lambda x: (x * long_h_df.loc[x.index, "weight"]).sum()),
+                         avg_ret=(ret_var, "mean"),
+                         months_held=(ret_var, "count"))
+                    .reset_index()
+                    .sort_values("total_contrib", ascending=False))
+    top10_profitable = long_contrib.head(10)
+    top10_profitable.to_csv(os.path.join(out_dir, "slide5_top10_profitable_longs.csv"), index=False)
 
-    # 1) Monthly holdings with weights
-    holdings.to_csv("output/monthly_holdings.csv", index=False)
-    print(f"\n  Holdings saved to output/monthly_holdings.csv")
-    print(f"    Columns: year, month, date, permno, {model}, "
-          f"{ret_var}, weight, side")
+    # Worst 10 long positions
+    worst10_longs = long_contrib.tail(10).sort_values("total_contrib")
+    worst10_longs.to_csv(os.path.join(out_dir, "slide5_worst10_longs.csv"), index=False)
 
-    # 2) Strategy returns
-    strat_m.to_csv("output/portfolio_summary.csv", index=False)
-    print(f"  Portfolio summary saved to output/portfolio_summary.csv")
+    # Top 10 most profitable short positions (most negative realized = best for shorts)
+    short_contrib = (short_h_df.groupby("permno")
+                     .agg(total_contrib=(ret_var, lambda x: -(x * short_h_df.loc[x.index, "weight"].abs()).sum()),
+                          avg_ret=(ret_var, "mean"),
+                          months_held=(ret_var, "count"))
+                     .reset_index()
+                     .sort_values("total_contrib", ascending=False))
+    top10_profitable_shorts = short_contrib.head(10)
+    top10_profitable_shorts.to_csv(os.path.join(out_dir, "slide5_top10_profitable_shorts.csv"), index=False)
 
-    # 3) Print sample holdings for first month
-    first_date = holdings["date"].min()
-    first_month = holdings[holdings["date"] == first_date]
-    longs = first_month[first_month["side"] == "long"].sort_values(
-        "weight", ascending=False)
-    shorts = first_month[first_month["side"] == "short"].sort_values(
-        "weight", ascending=True)
+    # Yearly performance breakdown
+    strat_m["yr"] = strat_m["year"]
+    yearly = strat_m.groupby("yr").agg(
+        strategy_ret=("ls_ret", lambda x: (1+x).prod() - 1),
+        long_ret=("long_ret", lambda x: (1+x).prod() - 1),
+        sp500_ret=("sp_ret", lambda x: (1+x).prod() - 1),
+        strategy_std=("ls_ret", "std"),
+        n_months=("ls_ret", "count"),
+    ).reset_index()
+    yearly["strategy_sharpe"] = (yearly["strategy_ret"] / yearly["n_months"]) / yearly["strategy_std"] * np.sqrt(12)
+    yearly["excess_vs_sp500"] = yearly["strategy_ret"] - yearly["sp500_ret"]
+    yearly.to_csv(os.path.join(out_dir, "slide5_yearly_performance.csv"), index=False)
+    print(f"  Saved: slide_deck/slide5_yearly_performance.csv")
 
-    print(f"\n  --- Sample: {first_date} ---")
-    print(f"  Top 5 LONG positions:")
-    for _, row in longs.head(5).iterrows():
-        print(f"    permno={int(row['permno']):>6d}  "
-              f"weight={row['weight']:+.4f}  "
-              f"pred={row[model]:+.6f}  "
-              f"realized={row[ret_var]:+.6f}")
-    print(f"  Top 5 SHORT positions:")
-    for _, row in shorts.head(5).iterrows():
-        print(f"    permno={int(row['permno']):>6d}  "
-              f"weight={row['weight']:+.4f}  "
-              f"pred={row[model]:+.6f}  "
-              f"realized={row[ret_var]:+.6f}")
+    # Discussion text
+    best_year = yearly.loc[yearly["strategy_ret"].idxmax()]
+    worst_year = yearly.loc[yearly["strategy_ret"].idxmin()]
 
-    # --- Expanding Sharpe ratio plot ---
-    strat_m["date_plot"] = pd.to_datetime(
-        strat_m["year"].astype(str) + "-"
-        + strat_m["month"].astype(str) + "-01")
+    disc_lines = [
+        "STRATEGY DISCUSSION",
+        "=" * 60,
+        "",
+        f"Best year:  {int(best_year['yr'])}  return = {best_year['strategy_ret']*100:+.2f}%",
+        f"Worst year: {int(worst_year['yr'])}  return = {worst_year['strategy_ret']*100:+.2f}%",
+        "",
+        "Yearly Performance:",
+        f"  {'Year':>6s}  {'Strategy':>10s}  {'S&P500':>10s}  {'Excess':>10s}",
+    ]
+    for _, r in yearly.iterrows():
+        disc_lines.append(
+            f"  {int(r['yr']):>6d}  {r['strategy_ret']*100:>+9.2f}%  "
+            f"{r['sp500_ret']*100:>+9.2f}%  {r['excess_vs_sp500']*100:>+9.2f}%")
+    disc_lines += [
+        "",
+        "Top 10 Most Profitable Long Holdings (by total weighted return contribution):",
+        f"  {'permno':>8s}  {'total_contrib':>14s}  {'avg_ret':>10s}  {'months':>6s}",
+    ]
+    for _, r in top10_profitable.iterrows():
+        disc_lines.append(
+            f"  {int(r['permno']):>8d}  {r['total_contrib']:>+14.6f}  "
+            f"{r['avg_ret']:>+10.6f}  {int(r['months_held']):>6d}")
+    disc_lines += [
+        "",
+        "Top 10 Most Profitable Short Holdings:",
+        f"  {'permno':>8s}  {'total_contrib':>14s}  {'avg_ret':>10s}  {'months':>6s}",
+    ]
+    for _, r in top10_profitable_shorts.iterrows():
+        disc_lines.append(
+            f"  {int(r['permno']):>8d}  {r['total_contrib']:>+14.6f}  "
+            f"{r['avg_ret']:>+10.6f}  {int(r['months_held']):>6d}")
 
-    def expanding_sharpe(series):
-        sharpes = []
-        for i in range(1, len(series) + 1):
-            s = series.iloc[:i]
-            if i < 2:
-                sharpes.append(0.0)
-            else:
-                sharpes.append(s.mean() / s.std() * np.sqrt(12))
-        return sharpes
+    with open(os.path.join(out_dir, "slide5_discussion.txt"), "w") as f:
+        f.write("\n".join(disc_lines))
+    print(f"  Saved: slide_deck/slide5_discussion.txt")
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(strat_m["date_plot"], expanding_sharpe(strat_m["ls_ret"]),
-            label="Long-Short", linewidth=2)
-    ax.plot(strat_m["date_plot"], expanding_sharpe(strat_m["long_ret"]),
-            label=f"Long Top {n_long}", linewidth=1.5)
-    ax.plot(strat_m["date_plot"], expanding_sharpe(strat_m["sp_ret"]),
-            label="S&P 500", linewidth=1.5, alpha=0.7)
-    ax.axhline(y=0, color="black", linestyle="--", linewidth=0.5)
-    ax.set_title(f"Expanding Annualized Sharpe Ratio - {scheme}-weight "
-                 f"(L{n_long}/S{n_short})")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Annualized Sharpe Ratio")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    # ---------------------------------------------------------------
+    # BONUS: Decile analysis (sorting into 10 buckets)
+    # ---------------------------------------------------------------
+    decile_returns = []
+    for (yr, mo), group in pred.groupby(["year", "month"]):
+        g = group.copy()
+        g["decile"] = pd.qcut(g[model], 10, labels=False, duplicates="drop") + 1
+        for d in range(1, 11):
+            sub = g[g["decile"] == d]
+            if len(sub) > 0:
+                decile_returns.append({
+                    "year": yr, "month": mo, "decile": d,
+                    "mean_ret": sub[ret_var].mean(),
+                    "n_stocks": len(sub),
+                })
+    decile_df = pd.DataFrame(decile_returns)
+    decile_summary = decile_df.groupby("decile").agg(
+        avg_monthly_ret=("mean_ret", "mean"),
+        ann_ret=("mean_ret", lambda x: x.mean() * 12),
+        std_monthly=("mean_ret", "std"),
+        sharpe=("mean_ret", lambda x: x.mean() / x.std() * np.sqrt(12) if x.std() > 0 else 0),
+        avg_n_stocks=("n_stocks", "mean"),
+    ).reset_index()
+    decile_summary["spread_10_1"] = (
+        decile_summary.loc[decile_summary["decile"] == 10, "avg_monthly_ret"].values[0]
+        - decile_summary.loc[decile_summary["decile"] == 1, "avg_monthly_ret"].values[0]
+    )
+    decile_summary.to_csv(os.path.join(out_dir, "decile_portfolio_returns.csv"), index=False)
+    print(f"  Saved: slide_deck/decile_portfolio_returns.csv")
+
+    # Decile bar chart
+    fig_dec, ax_dec = plt.subplots(figsize=(10, 5))
+    colors = ['#d62728' if d <= 3 else '#2ca02c' if d >= 8 else '#7f7f7f'
+              for d in decile_summary["decile"]]
+    ax_dec.bar(decile_summary["decile"], decile_summary["ann_ret"] * 100, color=colors)
+    ax_dec.set_xlabel("Decile (1=lowest predicted, 10=highest predicted)")
+    ax_dec.set_ylabel("Avg Annualized Return (%)")
+    ax_dec.set_title("Decile Portfolio Returns by Predicted Return Rank")
+    ax_dec.set_xticks(range(1, 11))
+    ax_dec.axhline(y=0, color="black", linewidth=0.5)
+    ax_dec.grid(True, alpha=0.3, axis="y")
     plt.tight_layout()
-    plt.savefig("output/cumulative_returns.png", dpi=150)
-    print(f"\n  Plot saved to output/cumulative_returns.png")
+    plt.savefig(os.path.join(out_dir, "decile_returns.png"), dpi=150)
+    print(f"  Saved: slide_deck/decile_returns.png")
 
-    return holdings, strat_m, metrics
+    # ---------------------------------------------------------------
+    # Strategy monthly returns CSV (for easy import to slides)
+    # ---------------------------------------------------------------
+    strat_export = strat_m[["year", "month", "date_plot", "ls_ret", "long_ret",
+                             "short_ret", "sp_ret"]].copy()
+    strat_export.columns = ["year", "month", "date", "strategy_ls_ret",
+                            "strategy_long_ret", "strategy_short_ret", "sp500_ret"]
+    strat_export.to_csv(os.path.join(out_dir, "monthly_returns_comparison.csv"), index=False)
+    print(f"  Saved: slide_deck/monthly_returns_comparison.csv")
+
+    print(f"\n  All slide deck outputs saved to: {out_dir}/")
+    return out_dir
 
 
 # ===========================================================================
@@ -909,5 +955,14 @@ if __name__ == "__main__":
     holdings, strat, metrics = full_evaluation(
         pred, mkt, model, n_long, n_short, scheme)
 
+    # --- Step 3: Generate all slide deck outputs ---
     print(f"\n{'='*60}")
-    print("Done!")
+    print("GENERATING SLIDE DECK OUTPUTS")
+    print(f"{'='*60}")
+    generate_slide_deck_outputs(
+        pred, holdings, strat, metrics, mkt,
+        model, n_long, n_short, scheme)
+
+    print(f"\n{'='*60}")
+    print("Done! All outputs for the 5-page slide deck are in output/slide_deck/")
+    print("="*60)
