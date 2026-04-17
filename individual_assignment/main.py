@@ -233,6 +233,102 @@ def ae_predict(Z_train, X_train, Y_train,
 
 
 # ===========================================================================
+#  MODEL 3: NN2  (2-hidden-layer MLP -- the lab1 Sharpe driver)
+# ===========================================================================
+
+class NN2(nn.Module):
+    """Two-hidden-layer MLP with batch norm. L1 reg on fc1 added in training."""
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(input_dim, 32)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.fc2 = nn.Linear(32, 16)
+        self.bn2 = nn.BatchNorm1d(16)
+        self.fc3 = nn.Linear(16, 1)
+
+    def forward(self, x):
+        x = F.relu(self.bn1(self.fc1(x)))
+        x = F.relu(self.bn2(self.fc2(x)))
+        return torch.squeeze(self.fc3(x))
+
+
+def _train_nn(model, criterion, loader, optimizer, device, l1_lambda=1e-4):
+    model.train()
+    torch.set_grad_enabled(True)
+    total_loss = 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        pred = model(x)
+        loss = criterion(pred, y)
+        loss = loss + l1_lambda * torch.norm(model.fc1.weight, p=1)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item() * len(x)
+    return total_loss / len(loader.dataset)
+
+
+def _eval_nn(model, criterion, loader, device):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            loss = criterion(pred, y)
+            total_loss += loss.item() * len(x)
+    return total_loss / len(loader.dataset)
+
+
+def nn_predict(X_train, Y_train_dm, X_val, Y_val_dm, X_test,
+               device, ensemble=3, epochs=100, patience=5,
+               batch_size=10000, lr=0.01, l1_lambda=1e-4):
+    """Train `ensemble` NN2 models; return mean OOS predictions (demeaned)."""
+    input_dim = X_train.shape[1]
+    train_ds = TensorDataset(
+        torch.from_numpy(X_train.astype(np.float32)),
+        torch.from_numpy(Y_train_dm.astype(np.float32)),
+    )
+    val_ds = TensorDataset(
+        torch.from_numpy(X_val.astype(np.float32)),
+        torch.from_numpy(Y_val_dm.astype(np.float32)),
+    )
+    X_test_t = torch.from_numpy(X_test.astype(np.float32)).to(device)
+    criterion = nn.MSELoss()
+    mean_pred = np.zeros((X_test.shape[0], ensemble), dtype=np.float32)
+
+    for i in range(ensemble):
+        model = NN2(input_dim).to(device)
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+        # decay lr: 0.01 * 0.955^100 ~= 1e-4 (matches lab1)
+        scheduler = optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.955)
+        tr_loader = torch.utils.data.DataLoader(train_ds, batch_size=batch_size, shuffle=True)
+        va_loader = torch.utils.data.DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+
+        best_val, no_improve, best_state = float("inf"), 0, None
+        for epoch in range(epochs):
+            _train_nn(model, criterion, tr_loader, optimizer, device, l1_lambda)
+            vl = _eval_nn(model, criterion, va_loader, device)
+            if vl < best_val:
+                best_val, no_improve = vl, 0
+                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            else:
+                no_improve += 1
+            if no_improve >= patience:
+                break
+            scheduler.step()
+
+        model.load_state_dict(best_state)
+        model.eval()
+        with torch.no_grad():
+            mean_pred[:, i] = model(X_test_t).cpu().numpy()
+        del model, optimizer, scheduler
+        gc.collect()
+
+    return mean_pred.mean(axis=1)
+
+
+# ===========================================================================
 #  DATA LOADING & PREPROCESSING
 # ===========================================================================
 
@@ -308,13 +404,78 @@ def load_and_preprocess(data_dir):
     del chunks
     gc.collect()
 
-    print(f"  Preprocessed: {data.shape[0]:,} rows", flush=True)
-    return data, stock_vars, mkt
+    # ── Build char × macro interactions (lab1-style) ──────────────────────────
+    # Each firm-char multiplied by each macro variable for that month gives the
+    # model access to regime-dependent anomaly behavior. Macros are constant in
+    # the cross-section on any given date, so the only way a cross-sectional
+    # model can learn regime effects is via these hand-crafted interactions.
+    macro_path = os.path.join(data_dir, "macro_data_goyal_enhanced.csv")
+    # Drop the 8 classic Goyal predictors (dp/ep/bm/ntis/tbl/tms/dfy/svar):
+    # the professor-provided initial file only covers them through 2019-12,
+    # so on any 2020-2023 test month they'd be mean-filled (= constant), and
+    # 151 chars × 8 classics = 1208 near-constant interaction columns just
+    # add noise and ~1.5 GB of RAM per window without contributing signal.
+    # We keep only the GWZ 2024 monthly predictors, which cover through 2023.
+    CLASSIC_MACROS = {"dp", "ep", "bm", "ntis", "tbl", "tms", "dfy", "svar"}
+    interaction_vars = []
+    if os.path.exists(macro_path):
+        print("Building char × macro interactions...", flush=True)
+        macro = pd.read_csv(macro_path, parse_dates=["date1"])
+        macro_vars = [
+            c for c in macro.columns
+            if c not in ("yyyymm", "date1") and c not in CLASSIC_MACROS
+        ]
+
+        # align macro to the stock data's month-start dates
+        macro_aligned = macro.rename(columns={"date1": "date"}).sort_values("date")
+        # merge_asof = use the most recent macro row available on or before each stock date (no look-ahead)
+        data = data.sort_values("date").reset_index(drop=True)
+        data = pd.merge_asof(
+            data, macro_aligned[["date"] + macro_vars],
+            on="date", direction="backward",
+        )
+        # fill any remaining NaN macros with column mean (edge of series)
+        for mv in macro_vars:
+            data[mv] = data[mv].fillna(data[mv].mean())
+
+        # vectorized interaction: for each macro var, multiply every char column
+        # by the macro value on that row → len(stock_vars) new columns per macro
+        char_mat = data[stock_vars].values
+        new_cols = {}
+        for mv in macro_vars:
+            m_vec = data[mv].values.reshape(-1, 1)
+            prod = char_mat * m_vec
+            for j, sv in enumerate(stock_vars):
+                new_cols[f"{sv}_{mv}"] = prod[:, j]
+                interaction_vars.append(f"{sv}_{mv}")
+        # single concat avoids frame fragmentation
+        data = pd.concat(
+            [data, pd.DataFrame(new_cols, index=data.index)], axis=1
+        )
+        del new_cols, char_mat
+        gc.collect()
+        print(f"  Added {len(interaction_vars)} interaction features "
+              f"({len(stock_vars)} chars × {len(macro_vars)} macros)", flush=True)
+    else:
+        print("  macro_data_goyal_enhanced.csv not found — skipping interactions", flush=True)
+
+    # Industry dummies (ind1..ind68) if present in the raw dataset — used by
+    # tree/NN models but NOT rank-transformed or interacted.
+    ind_list = [f"ind{i}" for i in range(1, 69) if f"ind{i}" in data.columns]
+    if ind_list:
+        print(f"  Found {len(ind_list)} industry dummies", flush=True)
+
+    # Full feature list used by XGBoost + NN (AE still uses `stock_vars` only)
+    feature_vars = stock_vars + interaction_vars + ind_list
+
+    print(f"  Preprocessed: {data.shape[0]:,} rows, "
+          f"{len(feature_vars)} total features", flush=True)
+    return data, stock_vars, feature_vars, mkt
 
 
-#  EXPANDING-WINDOW ENSEMBLE  (XGBoost + Autoencoder)
-def run_ensemble_stage(data, stock_vars):
-    print("ENSEMBLE  (XGBoost + Autoencoder)", flush=True)
+#  EXPANDING-WINDOW ENSEMBLE  (XGBoost + NN2 + Autoencoder)
+def run_ensemble_stage(data, stock_vars, feature_vars):
+    print("ENSEMBLE  (XGBoost + NN2 + Autoencoder)", flush=True)
 
     ret_var = "stock_exret"
 
@@ -364,13 +525,16 @@ def run_ensemble_stage(data, stock_vars):
         sample = data_ae[(data_ae["date"] >= cutoff[0]) & (data_ae["date"] < cutoff[3])]
         sample_unique = sample.groupby("ret_eom").first().reset_index()
 
-        scaler = StandardScaler().fit(train[stock_vars])
-        X_train_sc = scaler.transform(train[stock_vars])
-        X_val_sc = scaler.transform(validate[stock_vars])
-        X_test_sc = scaler.transform(test[stock_vars])
-        Y_train = train[ret_var].values
-        Y_val = validate[ret_var].values
-        Y_test = test[ret_var].values
+        # XGBoost + NN use the FULL feature matrix (chars + macro interactions + industry)
+        # float32 halves memory vs the default float64 — at ~5k features and
+        # ~170k training rows, each copy is ~6.9 GB in fp64, ~3.5 GB in fp32.
+        scaler = StandardScaler().fit(train[feature_vars])
+        X_train_sc = scaler.transform(train[feature_vars]).astype(np.float32, copy=False)
+        X_val_sc = scaler.transform(validate[feature_vars]).astype(np.float32, copy=False)
+        X_test_sc = scaler.transform(test[feature_vars]).astype(np.float32, copy=False)
+        Y_train = train[ret_var].values.astype(np.float32, copy=False)
+        Y_val = validate[ret_var].values.astype(np.float32, copy=False)
+        Y_test = test[ret_var].values.astype(np.float32, copy=False)
 
         print(f"    Shapes: train={X_train_sc.shape}, val={X_val_sc.shape}, test={X_test_sc.shape}", flush=True)
 
@@ -392,7 +556,20 @@ def run_ensemble_stage(data, stock_vars):
         all_feat_imp.append(feat_imp)
         print("    XGBoost done", flush=True)
 
-        # (B) Autoencoder
+        # (B) NN2 -- the lab1 Sharpe driver
+        print("    NN2...", flush=True)
+        nn_p = nn_predict(
+            X_train=X_train_sc, Y_train_dm=Y_train_dm,
+            X_val=X_val_sc, Y_val_dm=Y_val_dm,
+            X_test=X_test_sc,
+            device=DEVICE, ensemble=3,
+            epochs=100, patience=5, batch_size=10000,
+            lr=0.01, l1_lambda=1e-4,
+        )
+        reg_pred["nn"] = nn_p + Y_mean
+        print("    NN2 done", flush=True)
+
+        # (C) Autoencoder -- uses raw rank-transformed chars, NOT interactions
         print("    Autoencoder...", flush=True)
         ae_p = ae_predict(
             Z_train=train[stock_vars].values,
@@ -414,21 +591,31 @@ def run_ensemble_stage(data, stock_vars):
         reg_pred["ae"] = ae_p
         print("    AE done", flush=True)
 
-        # Ensemble average
-        model_cols = ["xgb", "ae"]
+        # Ensemble average across all three models
+        model_cols = ["xgb", "nn", "ae"]
         reg_pred["ensemble"] = reg_pred[model_cols].mean(axis=1, skipna=True)
 
         pred_out = pd.concat([pred_out, reg_pred], ignore_index=True)
         counter += 1
+
+        # Explicit per-window cleanup: without this, window N's ~3.5 GB scaled
+        # matrices linger through python's lazy collection while window N+1
+        # allocates its own set and kicks us over the 62 GB cap.
+        del X_train_sc, X_val_sc, X_test_sc
+        del Y_train, Y_val, Y_test, Y_train_dm, Y_val_dm
+        del train, validate, test, sample, sample_unique, reg_pred
+        del scaler, xgb_p, nn_p, ae_p, feat_imp
         gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # --- Save XGBoost feature importances (Slide 3 & 5) ---
     if all_feat_imp:
         avg_imp = np.mean(np.vstack(all_feat_imp), axis=0)
-        feat_df = pd.DataFrame({"feature": stock_vars, "importance": avg_imp})
+        feat_df = pd.DataFrame({"feature": feature_vars, "importance": avg_imp})
         feat_df = feat_df.sort_values("importance", ascending=False).reset_index(drop=True)
-        os.makedirs("output", exist_ok=True)
-        feat_df.to_csv("output/xgb_feature_importance.csv", index=False)
+        os.makedirs("individual_assignment/output_last_day", exist_ok=True)
+        feat_df.to_csv("individual_assignment/output_last_day/xgb_feature_importance.csv", index=False)
         print(f"\n  Top 20 XGBoost features (avg across windows):", flush=True)
         for _, row in feat_df.head(20).iterrows():
             print(f"    {row['feature']:30s}  {row['importance']:.6f}", flush=True)
@@ -438,7 +625,7 @@ def run_ensemble_stage(data, stock_vars):
     print("OOS R-squared (benchmark = 0):", flush=True)
     yreal = pred_out[ret_var].values
     r2_records = []
-    for mn in ["xgb", "ae", "ensemble"]:
+    for mn in ["xgb", "nn", "ae", "ensemble"]:
         yp = pred_out[mn].values
         mask = ~np.isnan(yp)
         if mask.sum() == 0:
@@ -450,7 +637,7 @@ def run_ensemble_stage(data, stock_vars):
 
     # --- Save OOS R² by year for each model (Slide 3) ---
     r2_by_year = []
-    for mn in ["xgb", "ae", "ensemble"]:
+    for mn in ["xgb", "nn", "ae", "ensemble"]:
         yp = pred_out[mn].values
         for yr in sorted(pred_out["year"].unique()):
             mask_yr = (pred_out["year"].values == yr) & ~np.isnan(yp)
@@ -459,10 +646,11 @@ def run_ensemble_stage(data, stock_vars):
             r2_yr = 1 - np.sum((yreal[mask_yr] - yp[mask_yr])**2) / np.sum(yreal[mask_yr]**2)
             r2_by_year.append({"model": mn, "year": yr, "oos_r2": r2_yr, "oos_r2_pct": r2_yr * 100})
 
-    os.makedirs("output", exist_ok=True)
-    pd.DataFrame(r2_records).to_csv("output/oos_r2_overall.csv", index=False)
-    pd.DataFrame(r2_by_year).to_csv("output/oos_r2_by_year.csv", index=False)
-    print("  Saved: output/oos_r2_overall.csv, output/oos_r2_by_year.csv", flush=True)
+    os.makedirs("individual_assignment/output_last_day", exist_ok=True)
+    pd.DataFrame(r2_records).to_csv("individual_assignment/output_last_day/oos_r2_overall.csv", index=False)
+    pd.DataFrame(r2_by_year).to_csv("individual_assignment/output_last_day/oos_r2_by_year.csv", index=False)
+    print("  Saved: individual_assignment/output_last_day/oos_r2_overall.csv, "
+          "individual_assignment/output_last_day/oos_r2_by_year.csv", flush=True)
 
     return pred_out
 
@@ -478,14 +666,14 @@ if __name__ == "__main__":
 
     DATA_DIR = os.path.join(os.path.dirname(__file__), "data_we")
 
-    data, stock_vars, mkt = load_and_preprocess(DATA_DIR)
+    data, stock_vars, feature_vars, mkt = load_and_preprocess(DATA_DIR)
 
-    # Ensemble: XGBoost + Autoencoder
-    pred_out = run_ensemble_stage(data, stock_vars)
+    # Ensemble: XGBoost + NN2 + Autoencoder
+    pred_out = run_ensemble_stage(data, stock_vars, feature_vars)
 
-    os.makedirs("output", exist_ok=True)
-    pred_out.to_csv("output/predictions.csv", index=False)
-    print("\nPredictions saved to output/predictions.csv", flush=True)
+    os.makedirs("individual_assignment/output_last_day", exist_ok=True)
+    pred_out.to_csv("individual_assignment/output_last_day/predictions.csv", index=False)
+    print("\nPredictions saved to individual_assignment/output_last_day/predictions.csv", flush=True)
     print("Now run build_portfolio.py to construct the trading strategy.", flush=True)
 
     t_end = datetime.datetime.now()

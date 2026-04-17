@@ -1,7 +1,7 @@
 """
 build_portfolio.py - Portfolio Construction & Sharpe Optimization
 ================================================================
-Reads predictions from output/predictions.csv (produced by main.py)
+Reads predictions from output_last_day/predictions.csv (produced by main.py)
 and builds the month-by-month portfolio with explicit holdings & weights.
 
 HOW WEIGHTS WORK:
@@ -21,11 +21,11 @@ Grid searches only over: (60L/10S) and (70L/20S) — three weighting schemes eac
 Picks the config with the best turnover-adjusted Sharpe ratio.
 
 Outputs:
-  output/monthly_holdings.csv    - every stock, every month: weight, side, action
-  output/monthly_trades.csv      - only BUY and SELL actions (what you actually trade)
-  output/portfolio_summary.csv   - month-by-month returns
-  output/sharpe_grid.csv         - Sharpe for each config tested
-  output/cumulative_returns.png  - expanding Sharpe ratio plot
+  output_last_day/monthly_holdings.csv    - every stock, every month: weight, side, action
+  output_last_day/monthly_trades.csv      - only BUY and SELL actions (what you actually trade)
+  output_last_day/portfolio_summary.csv   - month-by-month returns
+  output_last_day/sharpe_grid.csv         - Sharpe for each config tested
+  output_last_day/cumulative_returns.png  - expanding Sharpe ratio plot
 """
 
 import os
@@ -38,6 +38,9 @@ import statsmodels.formula.api as smf
 from pandas.tseries.offsets import MonthBegin
 
 warnings.filterwarnings("ignore")
+
+# All outputs go here (matches main.py)
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output_last_day")
 
 # Configs to try: (n_long, n_short)
 # Assignment requires 50-100 stocks TOTAL (long + short combined)
@@ -423,23 +426,23 @@ def full_evaluation(pred, mkt, model, n_long, n_short, scheme):
                   f"{r['weight']:>8.4f}  {r[model]:>+10.6f}  {r[ret_var]:>+10.6f}")
 
     # --- Save outputs ---
-    os.makedirs("output", exist_ok=True)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    holdings.to_csv("output/monthly_holdings.csv", index=False)
-    print(f"\n  Saved: output/monthly_holdings.csv  "
+    holdings.to_csv(os.path.join(OUTPUT_DIR, "monthly_holdings.csv"), index=False)
+    print(f"\n  Saved: {OUTPUT_DIR}/monthly_holdings.csv  "
           f"({len(holdings):,} rows — all active positions each month)")
     print(f"    Columns: year, month, date, permno, {model}, "
           f"{ret_var}, weight, side, action")
     print(f"    action = BUY (new this month) | HOLD (carried over) | SELL (exiting)")
 
-    trades_df.to_csv("output/monthly_trades.csv", index=False)
+    trades_df.to_csv(os.path.join(OUTPUT_DIR, "monthly_trades.csv"), index=False)
     n_buys = (trades_df["action"] == "BUY").sum()
     n_sells = (trades_df["action"] == "SELL").sum()
-    print(f"  Saved: output/monthly_trades.csv  "
+    print(f"  Saved: {OUTPUT_DIR}/monthly_trades.csv  "
           f"({n_buys:,} BUYs + {n_sells:,} SELLs = {n_buys+n_sells:,} total trades)")
 
-    strat_m.to_csv("output/portfolio_summary.csv", index=False)
-    print(f"  Saved: output/portfolio_summary.csv")
+    strat_m.to_csv(os.path.join(OUTPUT_DIR, "portfolio_summary.csv"), index=False)
+    print(f"  Saved: {OUTPUT_DIR}/portfolio_summary.csv")
 
     # --- Expanding Sharpe plot ---
     strat_m["date_plot"] = pd.to_datetime(
@@ -466,8 +469,8 @@ def full_evaluation(pred, mkt, model, n_long, n_short, scheme):
     ax.legend()
     ax.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("output/cumulative_returns.png", dpi=150)
-    print(f"  Saved: output/cumulative_returns.png")
+    plt.savefig(os.path.join(OUTPUT_DIR, "cumulative_returns.png"), dpi=150)
+    print(f"  Saved: {OUTPUT_DIR}/cumulative_returns.png")
 
     return holdings, trades_df, strat_m, metrics
 
@@ -482,10 +485,10 @@ def generate_slide_deck_outputs(pred, holdings, strat_m, metrics, mkt,
                                 model, n_long, n_short, scheme):
     """
     Generate all CSV/PNG/TXT files needed for the slide deck.
-    Outputs go to output/slide_deck/.
+    Outputs go to {OUTPUT_DIR}/slide_deck/.
     """
     ret_var = "stock_exret"
-    out_dir = os.path.join(os.path.dirname(__file__), "output", "slide_deck")
+    out_dir = os.path.join(OUTPUT_DIR, "slide_deck")
     os.makedirs(out_dir, exist_ok=True)
 
     # ---------------------------------------------------------------
@@ -597,9 +600,9 @@ def generate_slide_deck_outputs(pred, holdings, strat_m, metrics, mkt,
     # SLIDE 3: Data & Methodology, OOS R²
     # ---------------------------------------------------------------
     # Copy OOS R² files if they exist
-    r2_overall_path = os.path.join(os.path.dirname(__file__), "output", "oos_r2_overall.csv")
-    r2_by_year_path = os.path.join(os.path.dirname(__file__), "output", "oos_r2_by_year.csv")
-    feat_imp_path = os.path.join(os.path.dirname(__file__), "output", "xgb_feature_importance.csv")
+    r2_overall_path = os.path.join(OUTPUT_DIR, "oos_r2_overall.csv")
+    r2_by_year_path = os.path.join(OUTPUT_DIR, "oos_r2_by_year.csv")
+    feat_imp_path = os.path.join(OUTPUT_DIR, "xgb_feature_importance.csv")
 
     methodology_lines = [
         "DATA & METHODOLOGY",
@@ -925,7 +928,7 @@ def generate_slide_deck_outputs(pred, holdings, strat_m, metrics, mkt,
 
 def generate_ppt_charts(strat_m, metrics, mkt, model, n_long, n_short, scheme):
     """Generate polished comparison charts suitable for PowerPoint slides."""
-    out_dir = os.path.join(os.path.dirname(__file__), "output", "slide_deck")
+    out_dir = os.path.join(OUTPUT_DIR, "slide_deck")
     os.makedirs(out_dir, exist_ok=True)
 
     # Ensure date column
@@ -1098,7 +1101,7 @@ if __name__ == "__main__":
     print("="*60)
 
     # Load predictions (produced by main.py)
-    pred_path = os.path.join(os.path.dirname(__file__), "output", "predictions.csv")
+    pred_path = os.path.join(OUTPUT_DIR, "predictions.csv")
     if not os.path.exists(pred_path):
         print(f"ERROR: {pred_path} not found.")
         print("Run main.py first to generate predictions.")
@@ -1116,8 +1119,8 @@ if __name__ == "__main__":
 
     # --- Step 1: Grid search for best Sharpe ---
     grid_df, best_config = grid_search_sharpe(pred, mkt, model=model)
-    grid_df.to_csv(os.path.join(os.path.dirname(__file__),
-                                "output", "sharpe_grid.csv"), index=False)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    grid_df.to_csv(os.path.join(OUTPUT_DIR, "sharpe_grid.csv"), index=False)
 
     # --- Step 2: Full evaluation with best config ---
     n_long, n_short, scheme = best_config
@@ -1139,5 +1142,5 @@ if __name__ == "__main__":
     generate_ppt_charts(strat, metrics, mkt, model, n_long, n_short, scheme)
 
     print(f"\n{'='*60}")
-    print("Done! All outputs for the 5-page slide deck are in output/slide_deck/")
+    print(f"Done! All outputs for the 5-page slide deck are in {OUTPUT_DIR}/slide_deck/")
     print("="*60)
