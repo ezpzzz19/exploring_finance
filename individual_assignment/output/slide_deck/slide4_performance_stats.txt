@@ -1,0 +1,16 @@
+PORTFOLIO PERFORMANCE STATISTICS
+OOS Period: 2010-01 to 2023-12
+================================================================================
+
+                          Metric Strategy (L/S) Long-Only         S&P 500
+           Avg Annualized Return          2.04%    13.09%          11.52%
+              Annualized Std Dev         23.12%    28.48%          14.82%
+         Annualized Sharpe Ratio          0.088     0.460           0.777
+         Annualized Alpha (CAPM)         -5.88%       N/A N/A (benchmark)
+                    Alpha t-stat          -1.00       N/A             N/A
+                       CAPM Beta          0.742       N/A           1.000
+    Annualized Information Ratio         -0.288       N/A             N/A
+                Maximum Drawdown        109.56%    73.86%          28.46%
+            Maximum 1-Month Loss        -26.03%   -34.40%         -12.51%
+Portfolio Turnover (monthly avg)          38.2%     39.2%             N/A
+                          Months            168       168             168

@@ -1,0 +1,21 @@
+EXECUTIVE SUMMARY
+============================================================
+
+Strategy: Ensemble Alpha Long-Short
+  ML Models: XGBoost (gradient boosted trees) + Autoencoder (conditional factor model)
+  Signal: Equal-weight average of XGBoost and Autoencoder predicted returns
+  Portfolio: Long top 60 / Short bottom 30 stocks, equal-weighted, monthly rebalance
+  Universe: ~1,000 large-cap US equities (above NYSE median market cap)
+  OOS Period: 2010-01 to 2023-12 (168 months)
+
+Performance vs S&P 500:
+  Metric                                  Strategy      S&P 500
+  -----------------------------------------------------------
+  Avg Annualized Return                      2.04%       11.52%
+  Annualized Std Dev                        23.12%       14.82%
+  Annualized Sharpe Ratio                    0.088        0.777
+  Annualized Alpha (CAPM)                   -5.88%           N/A
+
+  Final cumulative value of $1:
+    Strategy:  $0.92
+    S&P 500:   $4.28

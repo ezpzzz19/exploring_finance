@@ -1,0 +1,57 @@
+DATA & METHODOLOGY
+============================================================
+
+Data:
+  Source: mma_sample_v2.csv (Jensen, Kelly, Pedersen 2022) + WRDS Financial Ratios Suite
+  Universe: U.S. common shares above NYSE median market cap
+  Period: Jan 2000 - Dec 2023 (monthly)
+  Characteristics: 147+ firm-specific predictors (fundamentals, momentum, liquidity, etc.)
+  Preprocessing: Cross-sectional rank transform to [-1, 1] each month
+
+ML Models:
+  1. XGBoost (Gradient Boosted Trees)
+     - Grid search: learning rate {0.01, 0.1}, max depth {1, 2}
+     - Early stopping on validation set (15 rounds patience)
+     - n_estimators=1000, hist tree method
+
+  2. Autoencoder (Gu, Kelly & Xiu 2021)
+     - Conditional factor model with managed portfolios
+     - Architecture: input -> 32 hidden -> K factors (K=6)
+     - 3-model ensemble, L1 regularization, Adam optimizer
+     - Early stopping (5 epochs patience), batch size=1000
+
+  Ensemble: Equal-weight average of XGBoost + Autoencoder predictions
+
+Training Procedure (Expanding Window):
+  - Initial training: 2000-2007 (8 years)
+  - Initial validation: 2008-2009 (2 years)
+  - First OOS test: 2010 (1 year)
+  - Expand training by 1 year, roll validation by 1 year, repeat
+  - Final OOS predictions: 2010-2023 (14 years, 168 months)
+
+OOS R² (benchmark = 0, i.e. no predictability):
+  xgb           R² = 0.003334  (0.3334%)
+  ae            R² = 0.006313  (0.6313%)
+  ensemble      R² = 0.007184  (0.7184%)
+
+Top 20 Predictive Features (XGBoost avg importance):
+   1. io_buy_sell_ratio               0.542901
+   2. io_num_holders                  0.074795
+   3. age                             0.064385
+   4. divyield                        0.056669
+   5. roce                            0.047969
+   6. roa                             0.041262
+   7. ps                              0.035245
+   8. lti_gr1a                        0.015797
+   9. io_share_change_pct             0.008651
+  10. rd_sale                         0.008395
+  11. ibes_numup                      0.008326
+  12. at_me                           0.008291
+  13. sti_gr1a                        0.007895
+  14. io_new_holders                  0.005635
+  15. peg_trailing                    0.004672
+  16. ebit_bev                        0.003876
+  17. npm                             0.003862
+  18. opmbd                           0.003235
+  19. cash_ratio                      0.003063
+  20. gp_at                           0.002979
